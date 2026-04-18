@@ -13,6 +13,7 @@ import base64
 from PIL import Image
 import io
 import akshare as ak
+import os
 
 # ====================== 使用 Streamlit Secrets 管理密钥 ======================
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -26,6 +27,37 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="基金智能管理系统", layout="wide")
 st.title("📈 基金智能管理系统")
 
+# ---------------------- 全量基金列表（适配带引号文件名）----------------------
+FULL_LIST_FILE = '"fund_full_list.csv"'  # 注意文件名带双引号
+
+@st.cache_data(ttl=86400)
+def load_full_fund_list():
+    """加载全市场基金列表 CSV"""
+    try:
+        df = pd.read_csv(FULL_LIST_FILE, dtype={"基金代码": str})
+        return df
+    except Exception as e:
+        st.error(f"读取全量基金列表失败：{e}")
+        return pd.DataFrame(columns=["基金代码", "基金简称"])
+
+def query_fund_code(keyword: str) -> dict:
+    """在全量 CSV 中模糊匹配基金代码"""
+    if not keyword:
+        return {}
+    df = load_full_fund_list()
+    if df.empty:
+        return {}
+    # 清洗关键词，提高匹配率
+    clean_kw = keyword.replace("(QDII)", "").replace("QDII", "").replace("C类", "").replace("C", "").strip()
+    # 先尝试清洗后匹配
+    mask = df["基金简称"].str.contains(clean_kw, case=False, na=False)
+    if not mask.any():
+        mask = df["基金简称"].str.contains(keyword, case=False, na=False)
+    if mask.any():
+        row = df[mask].iloc[0]
+        return {"code": row["基金代码"], "name": row["基金简称"]}
+    return {}
+
 # ---------------------- 百度OCR识别函数（含图片压缩）----------------------
 def get_baidu_access_token():
     url = "https://aip.baidubce.com/oauth/2.0/token"
@@ -37,8 +69,7 @@ def get_baidu_access_token():
     try:
         response = requests.post(url, params=params, timeout=10)
         return response.json().get("access_token")
-    except Exception as e:
-        st.error(f"百度OCR token获取失败：{e}")
+    except:
         return None
 
 def ocr_image(image_file):
@@ -51,8 +82,7 @@ def ocr_image(image_file):
         buffered = io.BytesIO()
         img.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode()
-    except Exception as e:
-        st.error(f"图片处理失败：{e}")
+    except:
         return ""
 
     url = "https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic"
@@ -66,10 +96,8 @@ def ocr_image(image_file):
             words = [item["words"] for item in result["words_result"]]
             return "\n".join(words)
         else:
-            st.error(f"OCR识别失败：{result.get('error_msg', '未知错误')}")
             return ""
-    except Exception as e:
-        st.error(f"OCR请求异常：{e}")
+    except:
         return ""
 
 # ---------------------- DeepSeek AI 客户端（含超时和重试）----------------------
@@ -82,7 +110,6 @@ def get_deepseek_client():
     )
 
 def parse_portfolio_by_ai(ocr_text: str) -> list:
-    """使用DeepSeek从OCR文字中提取基金名称和持仓金额"""
     client = get_deepseek_client()
     prompt = f"""
 请从以下支付宝基金持仓页面的OCR识别文字中，提取所有基金的信息。
@@ -109,58 +136,12 @@ OCR文字内容：
         json_match = re.search(r'\[.*\]', content, re.DOTALL)
         if json_match:
             funds = json.loads(json_match.group())
-            funds = [f for f in funds if f.get("market_value", 0) > 1000]
-            return funds
+            return [f for f in funds if f.get("market_value", 0) > 1000]
         return []
-    except Exception as e:
-        st.error(f"AI解析失败：{e}")
+    except:
         return []
 
-# ---------------------- AkShare 基金代码查询（带调试信息）----------------------
-@st.cache_data(ttl=3600)  # 缓存1小时，方便调试
-def get_all_funds_df():
-    """获取全市场基金列表 DataFrame，包含 ['基金代码', '基金简称']"""
-    try:
-        st.info("正在从 AkShare 获取全市场基金列表...")
-        df = ak.fund_name_em()
-        st.success(f"✅ 成功获取基金列表，共 {len(df)} 条记录")
-        return df[["基金代码", "基金简称"]].copy()
-    except Exception as e:
-        st.error(f"❌ 获取基金列表失败：{e}")
-        return pd.DataFrame(columns=["基金代码", "基金简称"])
-
-def query_fund_code_akshare(keyword: str) -> dict:
-    """根据关键词模糊匹配基金代码和标准名称，返回 {"code": "xxxxxx", "name": "标准简称"}"""
-    if not keyword:
-        return {}
-    
-    # 显示正在查询的关键词
-    st.write(f"🔍 正在查询：{keyword}")
-    
-    df = get_all_funds_df()
-    if df.empty:
-        st.warning("⚠️ 基金列表为空，无法查询")
-        return {}
-    
-    # 清洗关键词：移除常见后缀和括号内容，提高匹配率
-    clean_keyword = keyword.replace("(QDII)", "").replace("QDII", "").replace("C类", "").replace("C", "").strip()
-    # 也尝试保留C进行匹配
-    keywords_to_try = [keyword, clean_keyword]
-    
-    for kw in keywords_to_try:
-        if not kw:
-            continue
-        mask = df["基金简称"].str.contains(kw, case=False, na=False)
-        if mask.any():
-            row = df[mask].iloc[0]
-            result = {"code": row["基金代码"], "name": row["基金简称"]}
-            st.success(f"✅ 匹配成功：{kw} → {result['code']} {result['name']}")
-            return result
-    
-    st.warning(f"⚠️ 未找到匹配的基金代码，尝试的关键词：{keywords_to_try}")
-    return {}
-
-# ---------------------- 基金数据获取（历史净值用 AkShare）----------------------
+# ---------------------- 基金数据获取 ----------------------
 def get_fund_info(fund_code):
     url = f"http://fundgz.1234567.com.cn/js/{fund_code}.js"
     try:
@@ -176,12 +157,10 @@ def get_fund_info(fund_code):
             "estimate_change": float(data.get("gszzl", 0)),
             "update_time": data.get("jzrq", "")
         }
-    except Exception as e:
-        st.error(f"获取基金{fund_code}实时数据失败：{e}")
+    except:
         return None
 
 def get_historical_nav(fund_code, days=365):
-    """使用 AkShare 获取历史净值"""
     try:
         df = ak.fund_open_fund_info_em(symbol=fund_code, indicator="单位净值走势")
         if df.empty:
@@ -190,8 +169,7 @@ def get_historical_nav(fund_code, days=365):
         df["date"] = pd.to_datetime(df["date"])
         df = df[df["date"] >= df["date"].max() - pd.Timedelta(days=days)]
         return df.sort_values("date")
-    except Exception as e:
-        st.error(f"获取历史净值失败（{fund_code}）：{e}")
+    except:
         return None
 
 # ---------------------- 指标计算 ----------------------
@@ -256,8 +234,7 @@ def load_strategy_config():
     try:
         res = supabase.table("strategy_config").select("*").execute()
         return {row["rule_name"]: row["rule_value"] for row in res.data} if res.data else {"T_SELL_THRESHOLD": 2.0}
-    except Exception as e:
-        st.error(f"加载策略配置失败：{e}")
+    except:
         return {"T_SELL_THRESHOLD": 2.0}
 
 def ai_chat(messages, funds_context):
@@ -267,8 +244,8 @@ def ai_chat(messages, funds_context):
     try:
         response = client.chat.completions.create(model="deepseek-chat", messages=full_messages, stream=False)
         return response.choices[0].message.content
-    except Exception as e:
-        return f"AI调用失败：{e}"
+    except:
+        return "AI调用失败"
 
 # ---------------------- 侧边栏导航 ----------------------
 st.sidebar.title("功能导航")
@@ -342,7 +319,7 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理（带调试信息）----------------------
+# ---------------------- 持仓管理（全量CSV查询）----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
@@ -352,19 +329,17 @@ elif page == "📁 持仓管理":
             with st.spinner("OCR识别中..."):
                 ocr_text = ocr_image(uploaded_file)
                 if ocr_text:
-                    st.text_area("OCR识别文字", ocr_text, height=100)
                     funds_parsed = parse_portfolio_by_ai(ocr_text)
                     if funds_parsed:
                         st.success(f"识别到 {len(funds_parsed)} 只基金")
                         
-                        # 使用 AkShare 补全代码（带调试）
-                        st.subheader("🔎 代码匹配调试信息")
+                        # 查询代码：全量CSV模糊匹配
                         for fund in funds_parsed:
                             if "code" not in fund or not fund["code"]:
-                                ak_result = query_fund_code_akshare(fund["name"])
-                                if ak_result.get("code"):
-                                    fund["code"] = ak_result["code"]
-                                    fund["name"] = ak_result["name"]
+                                matched = query_fund_code(fund["name"])
+                                if matched:
+                                    fund["code"] = matched["code"]
+                                    fund["name"] = matched["name"]
                         
                         res_existing = supabase.table("portfolio").select("*").execute()
                         df_existing = pd.DataFrame(res_existing.data) if res_existing.data else pd.DataFrame()
@@ -400,35 +375,24 @@ elif page == "📁 持仓管理":
                             key="fund_editor"
                         )
                         
-                        missing_codes = any(row["基金代码"] in ["", "⚠️ 未识别"] for _, row in edited_df.iterrows())
-                        if missing_codes:
-                            st.warning("部分基金未能识别代码，请在上方表格中手动输入6位代码后点击更新")
-                        
                         if st.button("✅ 确认更新到我的持仓", type="primary"):
                             for _, row in edited_df.iterrows():
                                 code = row["基金代码"].strip()
                                 name = row["基金名称"].strip()
                                 if not code or code == "⚠️ 未识别" or not name:
                                     continue
-                                market_str = row["识别市值"].replace("¥", "").replace(",", "")
-                                market_value = float(market_str) if market_str else 0.0
-                                
                                 existing = df_existing[df_existing["fund_code"] == code] if not df_existing.empty else pd.DataFrame()
                                 if not existing.empty:
                                     update_dict = {
-                                        "fund_code": code,
-                                        "fund_name": name,
+                                        "fund_code": code, "fund_name": name,
                                         "shares": existing.iloc[0]["shares"],
                                         "cost_price": existing.iloc[0]["cost_price"],
                                         "category": existing.iloc[0]["category"]
                                     }
                                 else:
                                     update_dict = {
-                                        "fund_code": code,
-                                        "fund_name": name,
-                                        "category": "盈利底仓",
-                                        "shares": 0.0,
-                                        "cost_price": 0.0
+                                        "fund_code": code, "fund_name": name,
+                                        "category": "盈利底仓", "shares": 0.0, "cost_price": 0.0
                                     }
                                 supabase.table("portfolio").upsert(update_dict, on_conflict="fund_code").execute()
                             st.success("持仓已更新！")
@@ -463,26 +427,14 @@ elif page == "📁 持仓管理":
     st.subheader("当前持仓")
     try:
         res = supabase.table("portfolio").select("*").execute()
-        df = pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=["fund_code", "fund_name", "category", "shares", "cost_price", "buy_date"])
+        df = pd.DataFrame(res.data) if res.data else pd.DataFrame()
         if not df.empty:
-            edited_df = st.data_editor(
-                df,
-                num_rows="dynamic",
-                column_config={
-                    "fund_code": "基金代码",
-                    "fund_name": "基金名称",
-                    "category": "类型",
-                    "shares": st.column_config.NumberColumn("份额", format="%.2f"),
-                    "cost_price": st.column_config.NumberColumn("成本", format="%.4f"),
-                    "buy_date": "日期"
-                },
-                use_container_width=True
-            )
+            edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
             if st.button("💾 保存修改"):
                 for _, row in edited_df.iterrows():
                     supabase.table("portfolio").update({
                         "fund_name": row["fund_name"], "category": row["category"],
-                        "shares": row["shares"], "cost_price": row["cost_price"], "buy_date": row["buy_date"]
+                        "shares": row["shares"], "cost_price": row["cost_price"]
                     }).eq("fund_code", row["fund_code"]).execute()
                 st.success("✅ 保存成功")
                 st.rerun()
@@ -504,8 +456,8 @@ elif page == "⚙️ 策略参数配置":
                     supabase.table("strategy_config").update({"rule_value": row["rule_value"]}).eq("rule_name", row["rule_name"]).execute()
                 st.success("已更新")
                 st.rerun()
-    except Exception as e:
-        st.info(f"配置表暂不可用：{e}")
+    except:
+        st.info("配置表暂不可用")
 
 # ---------------------- AI对话 ----------------------
 elif page == "🤖 AI基金分析师":
