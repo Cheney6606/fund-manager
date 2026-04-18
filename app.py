@@ -28,7 +28,7 @@ st.set_page_config(page_title="基金智能管理系统", layout="wide")
 st.title("📈 基金智能管理系统")
 
 # ---------------------- 全量基金列表（适配带引号文件名）----------------------
-FULL_LIST_FILE = '"fund_full_list.csv"'  # 注意文件名带双引号
+FULL_LIST_FILE = "fund_full_list.csv"
 
 @st.cache_data(ttl=86400)
 def load_full_fund_list():
