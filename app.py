@@ -65,107 +65,86 @@ def ocr_image(image_file):
         st.error(f"OCR请求异常：{e}")
         return ""
 
-# ---------------------- DeepSeek AI 补全函数 ----------------------
-def query_fund_by_ai(query: str, query_type: str = "code") -> dict:
+# ---------------------- DeepSeek AI 补全函数（增强版）----------------------
+def query_fund_code_by_name(name: str) -> dict:
+    """根据基金名称查询代码，返回 {"code": "xxxxxx", "name": "标准名称"}"""
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-    if query_type == "code":
-        prompt = f"""请根据基金名称"{query}"，返回该基金的6位数字代码。
-        只返回一个JSON格式：{{"code": "xxxxxx", "name": "基金全称"}}
-        如果找不到，返回{{"code": "", "name": ""}}。不要输出任何其他文字。"""
-    else:
-        prompt = f"""请根据基金代码"{query}"，返回该基金的完整名称。
-        只返回一个JSON格式：{{"code": "{query}", "name": "基金全称"}}
-        如果找不到，返回{{"code": "{query}", "name": ""}}。不要输出任何其他文字。"""
+    prompt = f"""请查询基金名称为"{name}"的6位数字代码。只返回一个JSON：{{"code": "xxxxxx", "name": "基金全称"}}。如果找不到，code留空。不要输出任何其他文字。"""
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
             stream=False,
-            temperature=0.1
+            temperature=0
         )
         content = response.choices[0].message.content.strip()
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
         return {}
-    except Exception as e:
-        st.error(f"AI查询失败：{e}")
+    except:
         return {}
 
-# ---------------------- 增强版截图解析函数 ----------------------
-def parse_portfolio_from_ocr(text):
-    lines = text.split("\n")
+# ---------------------- 全新解析函数（针对列表页格式）----------------------
+def parse_portfolio_list_from_text(text):
+    """
+    专为支付宝持仓列表页设计。
+    格式特点：基金名称一行，下方紧随持仓金额（带逗号的数字），再下方是盈亏数据。
+    返回列表，每个元素为 {"name": xxx, "market_value": xxx}
+    """
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
     funds = []
-    code_pattern = re.compile(r'\b\d{6}\b')
-    number_pattern = re.compile(r'[\d,]+\.?\d*')
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # 判断是否为基金名称行：包含常见基金特征词，且不含纯数字或特殊符号
+        if any(kw in line for kw in ["混合", "ETF", "联接", "指数", "股票", "债券", "QDII", "优选", "成长", "价值", "灵活", "稳健"]):
+            # 过滤掉干扰行（如"市场解读"）
+            if "市场解读" in line or "金选" in line and "基金" in line:
+                i += 1
+                continue
+            
+            name = re.sub(r'金选指数基金|定投|市场解读.*', '', line).strip()
+            if len(name) < 3:
+                i += 1
+                continue
+            
+            # 找下一行的金额（通常是带逗号的大数字）
+            market_value = None
+            j = i + 1
+            while j < len(lines) and j < i + 5:
+                num_line = lines[j]
+                # 匹配金额格式（如 47,271.80 或 11,307.83）
+                num_match = re.search(r'([\d,]+\.\d{2})', num_line)
+                if num_match:
+                    try:
+                        val = float(num_match.group(1).replace(",", ""))
+                        if val > 100:  # 有效持仓金额
+                            market_value = val
+                            break
+                    except:
+                        pass
+                j += 1
+            
+            if market_value:
+                funds.append({
+                    "name": name,
+                    "market_value": market_value
+                })
+                i = j  # 跳过已处理的行
+            else:
+                i += 1
+        else:
+            i += 1
     
-    current_fund = {}
-    for line in lines:
-        # 1. 找基金代码
-        codes = code_pattern.findall(line)
-        if codes:
-            if current_fund:
-                funds.append(current_fund)
-                current_fund = {}
-            current_fund["fund_code"] = codes[0]
-            name_match = re.search(r'([\u4e00-\u9fa5].+?)(?=\d|$)', line)
-            if name_match:
-                current_fund["fund_name"] = name_match.group(1).strip()
-        
-        # 2. 识别基金名称（如果没有代码）
-        if "fund_code" not in current_fund:
-            if any(keyword in line for keyword in ["混合", "ETF", "联接", "指数", "股票", "债券", "QDII"]):
-                name = re.sub(r'金选|指数基金|定投|市场解读.*', '', line).strip()
-                if name and len(name) >= 4:
-                    current_fund["fund_name"] = name
-                    current_fund["fund_code"] = ""
-        
-        # 3. 提取持仓金额/市值
-        if "金额" in line or "持仓" in line or "持有" in line:
-            numbers = number_pattern.findall(line)
-            if numbers:
-                for num in numbers:
-                    val = float(num.replace(",", ""))
-                    if val > 100:
-                        current_fund["market_value"] = val
-                        break
-        
-        # 4. 提取成本价
-        if "成本价" in line or "持仓成本价" in line:
-            numbers = number_pattern.findall(line)
-            if numbers:
-                try:
-                    current_fund["cost_price"] = float(numbers[0].replace(",", ""))
-                except:
-                    pass
-        
-        # 5. 提取持有份额
-        if "持有份额" in line or "份额" in line:
-            numbers = number_pattern.findall(line)
-            if numbers:
-                try:
-                    current_fund["shares"] = float(numbers[0].replace(",", ""))
-                except:
-                    pass
-    
-    if current_fund:
-        funds.append(current_fund)
-    
-    # 后处理：用AI补全缺失的代码或名称
-    for fund in funds:
-        name = fund.get("fund_name", "")
-        code = fund.get("fund_code", "")
-        if name and not code:
-            ai_result = query_fund_by_ai(name, "code")
-            if ai_result.get("code"):
-                fund["fund_code"] = ai_result["code"]
-                fund["fund_name"] = ai_result.get("name", name)
-        elif code and not name:
-            ai_result = query_fund_by_ai(code, "name")
-            if ai_result.get("name"):
-                fund["fund_name"] = ai_result["name"]
-    
-    return funds
+    # 去重（根据名称）
+    seen = set()
+    unique_funds = []
+    for f in funds:
+        if f["name"] not in seen:
+            seen.add(f["name"])
+            unique_funds.append(f)
+    return unique_funds
 
 # ---------------------- 原有基金数据函数 ----------------------
 def get_fund_info(fund_code):
@@ -350,7 +329,7 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理（智能更新版）----------------------
+# ---------------------- 持仓管理（智能更新版 - 列表页优化）----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
@@ -360,59 +339,78 @@ elif page == "📁 持仓管理":
             with st.spinner("OCR识别中..."):
                 ocr_text = ocr_image(uploaded_file)
                 if ocr_text:
-                    funds_parsed = parse_portfolio_from_ocr(ocr_text)
+                    # 使用新的列表页解析函数
+                    funds_parsed = parse_portfolio_list_from_text(ocr_text)
                     if funds_parsed:
                         st.success(f"识别到 {len(funds_parsed)} 只基金")
+                        
+                        # 用AI补全代码
+                        for fund in funds_parsed:
+                            if "code" not in fund:
+                                ai_result = query_fund_code_by_name(fund["name"])
+                                fund["code"] = ai_result.get("code", "")
+                                if ai_result.get("name"):
+                                    fund["name"] = ai_result["name"]
+                        
+                        # 获取现有持仓
                         res_existing = supabase.table("portfolio").select("*").execute()
                         df_existing = pd.DataFrame(res_existing.data) if res_existing.data else pd.DataFrame()
+                        
                         preview_data = []
                         for fund in funds_parsed:
-                            code = fund.get("fund_code", "")
-                            name = fund.get("fund_name", "")
-                            market_value = fund.get("market_value", 0.0)
-                            shares = fund.get("shares")
-                            cost_price = fund.get("cost_price")
+                            code = fund.get("code", "")
+                            name = fund["name"]
+                            market_value = fund["market_value"]
                             existing = df_existing[df_existing["fund_code"] == code] if code and not df_existing.empty else pd.DataFrame()
                             action = "更新" if not existing.empty else ("新增" if code else "需补充代码")
                             preview_data.append({
                                 "状态": action,
                                 "基金代码": code if code else "⚠️ 未识别",
                                 "基金名称": name,
-                                "识别市值": f"¥{market_value:,.2f}" if market_value else "-",
-                                "识别份额": shares if shares else "-",
-                                "识别成本价": cost_price if cost_price else "-",
+                                "识别市值": f"¥{market_value:,.2f}",
                                 "当前份额": existing.iloc[0]["shares"] if action=="更新" else "-",
                                 "当前成本": existing.iloc[0]["cost_price"] if action=="更新" else "-"
                             })
+                        
                         df_preview = pd.DataFrame(preview_data)
                         st.dataframe(df_preview, use_container_width=True)
                         
-                        missing_codes = any(f.get("fund_code") == "" for f in funds_parsed)
+                        missing_codes = any(f.get("code") == "" for f in funds_parsed)
                         if missing_codes:
                             st.warning("部分基金未能识别代码，可在下方表格手动输入代码后点击更新")
                         
                         if st.button("✅ 确认更新到我的持仓", type="primary"):
                             for fund in funds_parsed:
-                                code = fund.get("fund_code")
-                                name = fund.get("fund_name")
+                                code = fund.get("code")
+                                name = fund["name"]
                                 if not code or not name:
                                     continue
-                                update_dict = {"fund_code": code, "fund_name": name}
-                                if "shares" in fund and fund["shares"]:
-                                    update_dict["shares"] = fund["shares"]
-                                if "cost_price" in fund and fund["cost_price"]:
-                                    update_dict["cost_price"] = fund["cost_price"]
-                                if "category" not in update_dict:
-                                    existing = df_existing[df_existing["fund_code"] == code] if not df_existing.empty else pd.DataFrame()
-                                    if not existing.empty:
-                                        update_dict["category"] = existing.iloc[0]["category"]
-                                    else:
-                                        update_dict["category"] = "盈利底仓"
+                                
+                                # 查询现有数据
+                                existing = df_existing[df_existing["fund_code"] == code] if not df_existing.empty else pd.DataFrame()
+                                if not existing.empty:
+                                    # 更新：保留原有份额和成本价，只更新市值不影响核心字段
+                                    update_dict = {
+                                        "fund_code": code,
+                                        "fund_name": name,
+                                        "shares": existing.iloc[0]["shares"],
+                                        "cost_price": existing.iloc[0]["cost_price"],
+                                        "category": existing.iloc[0]["category"]
+                                    }
+                                else:
+                                    # 新增：需要用户后续手动补充份额成本
+                                    update_dict = {
+                                        "fund_code": code,
+                                        "fund_name": name,
+                                        "category": "盈利底仓",
+                                        "shares": 0.0,
+                                        "cost_price": 0.0
+                                    }
                                 supabase.table("portfolio").upsert(update_dict, on_conflict="fund_code").execute()
                             st.success("持仓已更新！")
                             st.rerun()
                     else:
-                        st.warning("未能从截图中解析出基金信息")
+                        st.warning("未能从截图中解析出基金信息，请确保是支付宝持仓列表截图")
 
     with st.expander("➕ 手动添加持仓"):
         col1, col2, col3 = st.columns(3)
