@@ -5,3 +5,5 @@ plotly
 openai
 supabase
 numpy
+Pillow
+akshare==1.11.0
