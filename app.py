@@ -29,7 +29,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="基金智能管理系统", layout="wide")
 st.title("📈 基金智能管理系统")
 
-# ---------------------- 【优化版】百度OCR 解决分行名称拆分 ----------------------
+# ---------------------- 【优化版】百度OCR（高精度优先，失败降级通用）----------------------
 def get_baidu_access_token():
     url = "https://aip.baidubce.com/oauth/2.0/token"
     params = {
@@ -65,24 +65,35 @@ def ocr_image(image_file):
         st.error(f"图片处理失败: {e}")
         return ""
 
-    url = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
-    params = {"access_token": access_token}
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    data = {"image": img_base64, "probability": "false"}
-    try:
-        response = requests.post(url, params=params, headers=headers, data=data, timeout=15)
-        result = response.json()
-        if "words_result" in result:
-            full_text = "\n".join([item["words"] for item in result["words_result"]])
-            st.sidebar.subheader("📝 OCR原始识别结果")
-            st.sidebar.text_area("OCR全文", full_text, height=200)
-            return full_text
-        else:
-            st.error(f"OCR识别失败: {result}")
-            return ""
-    except Exception as e:
-        st.error(f"OCR请求异常: {e}")
-        return ""
+    # 优先尝试高精度OCR，失败则降级通用OCR
+    for ocr_type, url in [("高精度", "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"),
+                          ("通用", "https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic")]:
+        try:
+            params = {"access_token": access_token}
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            data = {"image": img_base64, "probability": "false"}
+            response = requests.post(url, params=params, headers=headers, data=data, timeout=15)
+            result = response.json()
+            if "words_result" in result:
+                full_text = "\n".join([item["words"] for item in result["words_result"]])
+                st.sidebar.subheader(f"📝 OCR原始识别结果（{ocr_type}）")
+                st.sidebar.text_area("OCR全文", full_text, height=200)
+                return full_text
+            else:
+                if ocr_type == "高精度":
+                    st.sidebar.warning(f"⚠️ 高精度OCR失败，降级尝试通用OCR... ({result.get('error_msg', '')})")
+                    continue
+                else:
+                    st.error(f"OCR识别失败: {result}")
+                    return ""
+        except Exception as e:
+            if ocr_type == "高精度":
+                st.sidebar.warning(f"⚠️ 高精度OCR异常，降级尝试通用OCR... ({e})")
+                continue
+            else:
+                st.error(f"OCR请求异常: {e}")
+                return ""
+    return ""
 
 # ---------------------- 【优化版】DeepSeek AI 杜绝名称提取错误 ----------------------
 def get_deepseek_client():
@@ -189,7 +200,6 @@ def load_full_fund_list():
             fund_type = "混合"
         elif "股票" in name:
             fund_type = "股票"
-        # 提取币种（人民币/美元）
         currency = "美元" if "美元" in name else "人民币"
         core_target = name
         core_target = re.sub(r'^(' + '|'.join(company_list) + ')', '', core_target)
@@ -211,7 +221,7 @@ def load_full_fund_list():
     st.sidebar.success(f"✅ 基金列表标准化完成 (共{len(full_df)}只)")
     return full_df
 
-# ---------------------- 【重构版】智能匹配逻辑（币种强制+去冗余）----------------------
+# ---------------------- 【重构版】智能匹配逻辑（币种强制+去冗余+兜底优化）----------------------
 def query_fund_code_smart(keyword: str) -> dict:
     if not keyword:
         return {}
@@ -224,7 +234,6 @@ def query_fund_code_smart(keyword: str) -> dict:
     debug_info = []
     debug_info.append(f"🔹 原始输入名称: {keyword}")
 
-    # 1. 优先6位代码精确匹配
     if str(keyword).isdigit() and len(str(keyword)) == 6:
         matched = full_df[full_df["基金代码"] == str(keyword)]
         if not matched.empty:
@@ -232,7 +241,6 @@ def query_fund_code_smart(keyword: str) -> dict:
             st.sidebar.success(f"🎯 6位代码精确匹配: {row['基金简称']} ({row['基金代码']})")
             return {"code": row["基金代码"], "name": row["基金简称"]}
 
-    # 2. 关键词标准化（含币种）
     def standardize_keyword(kw):
         kw = str(kw)
         kw = kw.translate(str.maketrans('（）【】', '()[]'))
@@ -273,7 +281,6 @@ def query_fund_code_smart(keyword: str) -> dict:
     debug_info.append(f"🔹 提取币种: {kw_std['currency']}")
     debug_info.append(f"🔹 提取核心标的: {kw_std['core_target']}")
 
-    # 3. 强约束筛选（含币种强制匹配）
     candidates = full_df.copy()
     if kw_std["company"]:
         candidates = candidates[candidates["company"] == kw_std["company"]]
@@ -282,7 +289,6 @@ def query_fund_code_smart(keyword: str) -> dict:
     candidates = candidates[candidates["share_type"] == kw_std["share_type"]]
     debug_info.append(f"✅ 份额类型筛选后剩余: {len(candidates)} 只")
     
-    # 强制币种匹配：如果用户输入不含“美元”，只匹配人民币份额
     if kw_std["currency"] == "人民币":
         candidates = candidates[candidates["currency"] == "人民币"]
         debug_info.append(f"✅ 币种筛选（强制人民币）后剩余: {len(candidates)} 只")
@@ -300,7 +306,6 @@ def query_fund_code_smart(keyword: str) -> dict:
         candidates["similarity"] = candidates["clean_name"].apply(
             lambda x: difflib.SequenceMatcher(None, kw_std["clean_kw"], x).ratio()
         )
-        # 排序：相似度优先，相同相似度时名称更短优先（去除冗余后缀）
         candidates = candidates.sort_values(["similarity", "name_length"], ascending=[False, True])
         
         st.sidebar.markdown("---")
@@ -313,14 +318,15 @@ def query_fund_code_smart(keyword: str) -> dict:
         debug_info.append(f"✅ 最佳匹配: {best['基金简称']} ({best['基金代码']})，相似度: {best['similarity']:.2f}")
     else:
         debug_info.append("❌ 强约束无匹配，启动兜底模糊匹配")
-        full_df["similarity"] = full_df["clean_name"].apply(
+        # 【优化】先筛选币种（如果明确非美元），再计算相似度排序
+        fallback_df = full_df.copy()
+        if kw_std["currency"] == "人民币":
+            fallback_df = fallback_df[fallback_df["currency"] == "人民币"]
+        fallback_df["similarity"] = fallback_df["clean_name"].apply(
             lambda x: difflib.SequenceMatcher(None, kw_std["clean_kw"], x).ratio()
         )
-        full_df = full_df.sort_values(["similarity", "name_length"], ascending=[False, True])
-        # 兜底时也强制币种（如果明确非美元）
-        if kw_std["currency"] == "人民币":
-            full_df = full_df[full_df["currency"] == "人民币"]
-        top_3 = full_df.head(3)
+        fallback_df = fallback_df.sort_values(["similarity", "name_length"], ascending=[False, True])
+        top_3 = fallback_df.head(3)
         st.sidebar.subheader("⚠️ 兜底匹配Top3")
         st.sidebar.dataframe(top_3[["基金代码", "基金简称", "similarity", "currency"]], use_container_width=True)
         
@@ -516,7 +522,7 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理（智能匹配版）----------------------
+# ---------------------- 持仓管理（智能匹配 + 自动估算份额成本）----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
@@ -577,6 +583,9 @@ elif page == "📁 持仓管理":
                                 name = row["基金名称"].strip()
                                 if not code or code == "⚠️ 未识别" or not name:
                                     continue
+                                market_str = row["识别市值"].replace("¥", "").replace(",", "")
+                                market_value = float(market_str) if market_str else 0.0
+                                
                                 existing = df_existing[df_existing["fund_code"] == code] if not df_existing.empty else pd.DataFrame()
                                 if not existing.empty:
                                     update_dict = {
@@ -586,9 +595,20 @@ elif page == "📁 持仓管理":
                                         "category": existing.iloc[0]["category"]
                                     }
                                 else:
+                                    # 【优化】自动估算份额和成本价（假设成本价 = 最新净值）
+                                    info = get_fund_info(code)
+                                    if info and info["net_value"] > 0:
+                                        shares = market_value / info["net_value"]
+                                        cost_price = info["net_value"]
+                                    else:
+                                        shares = 0.0
+                                        cost_price = 0.0
                                     update_dict = {
                                         "fund_code": code, "fund_name": name,
-                                        "category": "盈利底仓", "shares": 0.0, "cost_price": 0.0
+                                        "category": "盈利底仓",
+                                        "shares": round(shares, 2),
+                                        "cost_price": round(cost_price, 4),
+                                        "buy_date": str(datetime.now().date())
                                     }
                                 supabase.table("portfolio").upsert(update_dict, on_conflict="fund_code").execute()
                             st.success("持仓已更新！")
