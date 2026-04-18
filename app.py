@@ -9,7 +9,6 @@ import numpy as np
 from openai import OpenAI
 from supabase import create_client, Client
 from datetime import datetime
-import httpx
 import os
 
 # ====================== 安全配置：从环境变量读取密钥 ======================
@@ -18,9 +17,8 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 # ====================================================================================
 
-# 初始化客户端（已修复超时+连接问题）
-timeout = httpx.Timeout(20.0, connect=20.0, read=60.0)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, timeout=timeout)
+# 初始化客户端（去掉了不兼容的timeout参数）
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 st.set_page_config(page_title="我的基金管家", layout="wide")
 st.title("📈 我的基金智能管理系统")
