@@ -14,6 +14,7 @@ from PIL import Image
 import io
 import akshare as ak
 import os
+import difflib
 
 # ====================== 使用 Streamlit Secrets 管理密钥 ======================
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -30,113 +31,117 @@ st.title("📈 基金智能管理系统")
 # ---------------------- 调试信息 ----------------------
 st.sidebar.subheader("📁 部署环境")
 file_list = os.listdir('.')
+st.sidebar.write("文件列表:", file_list)
 csv_exists = os.path.exists("fund_full_list.csv")
 st.sidebar.write(f"fund_full_list.csv 存在: {csv_exists}")
 
-# ---------------------- 全量基金列表 ----------------------
+# ---------------------- 全量基金列表（CSV优先）----------------------
 @st.cache_data(ttl=3600)
 def load_full_fund_list():
+    """加载全市场基金列表，优先CSV，失败则用AkShare"""
     if os.path.exists("fund_full_list.csv"):
         try:
             df = pd.read_csv("fund_full_list.csv", dtype={"基金代码": str})
             if not df.empty:
-                st.sidebar.success("✅ 使用本地CSV")
+                st.sidebar.success("✅ 使用本地CSV文件")
                 return df
         except:
             pass
-    st.sidebar.info("🔄 降级使用AkShare")
+    
+    st.sidebar.info("🔄 降级使用AkShare实时获取基金列表...")
     try:
         df = ak.fund_name_em()
-        return df[["基金代码", "基金简称"]].copy()
+        df = df[["基金代码", "基金简称"]].copy()
+        return df
     except:
         return pd.DataFrame(columns=["基金代码", "基金简称"])
 
-import difflib
+# ---------------------- 智能匹配引擎 ----------------------
+def clean_for_match(text):
+    """清洗文本：移除所有括号、空格、特殊符号，只保留中文、英文、数字"""
+    if not isinstance(text, str):
+        text = str(text)
+    # 移除全角/半角括号、空格、连字符等
+    text = re.sub(r'[\(\)\s\-_（）]', '', text)
+    return text.lower()
 
-def query_fund_code(keyword: str) -> dict:
-    """智能基金代码匹配，优先C类，使用相似度阈值防止乱匹配"""
+def extract_keywords(text):
+    """提取基金公司名和核心关键词"""
+    # 提取前几个汉字作为公司名
+    company = re.search(r'^([\u4e00-\u9fa5]{2,6})', text)
+    company = company.group(1) if company else ""
+    # 提取核心词（如"新兴市场"、"纳斯达克"等）
+    core = re.search(r'(新兴|全球|纳斯达克|科创板|成长|消费|医药|科技|芯片|有色|黄金|债券)', text)
+    core = core.group(1) if core else ""
+    return company, core
+
+def query_fund_code_smart(keyword: str) -> dict:
+    """智能匹配基金代码，返回最佳匹配结果"""
     if not keyword:
         return {}
+    
     df = load_full_fund_list()
     if df.empty:
         return {}
-
-    # 原始名称列表和代码列表
-    names = df["基金简称"].astype(str).tolist()
-    codes = df["基金代码"].astype(str).tolist()
-
-    # ---------- 第1级：完全精确匹配 ----------
-    for i, name in enumerate(names):
-        if keyword == name:
-            return {"code": codes[i], "name": name}
-
-    # ---------- 第2级：忽略大小写的包含匹配，且优先C类 ----------
-    kw_lower = keyword.lower()
+    
+    # 准备数据
     candidates = []
-    for i, name in enumerate(names):
-        name_lower = name.lower()
-        if kw_lower in name_lower or name_lower in kw_lower:
-            candidates.append((codes[i], name, name_lower))
-    if candidates:
-        # 优先返回含'c'的（因为用户输入的名称大多含C）
-        for code, name, name_lower in candidates:
-            if 'c' in name_lower:
-                return {"code": code, "name": name}
-        # 否则返回第一个
-        return {"code": candidates[0][0], "name": candidates[0][1]}
+    keyword_clean = clean_for_match(keyword)
+    kw_company, kw_core = extract_keywords(keyword)
+    
+    for _, row in df.iterrows():
+        code = str(row["基金代码"])
+        name = str(row["基金简称"])
+        name_clean = clean_for_match(name)
+        score = 0
+        
+        # 1. 精确匹配（最高优先级）
+        if keyword == name:
+            score = 1000
+        # 2. 清洗后完全一致
+        elif keyword_clean == name_clean:
+            score = 900
+        # 3. 清洗后包含关系
+        elif keyword_clean in name_clean or name_clean in keyword_clean:
+            score = 800
+        # 4. 公司名 + 核心词同时匹配
+        elif kw_company and kw_core:
+            if kw_company in name and kw_core in name:
+                score = 700
+            elif kw_company in name:
+                score = 500
+        # 5. 公司名或核心词单一匹配
+        elif kw_company and kw_company in name:
+            score = 400
+        elif kw_core and kw_core in name:
+            score = 300
+        
+        # 6. 模糊相似度（兜底）
+        if score == 0:
+            ratio = difflib.SequenceMatcher(None, keyword_clean, name_clean).ratio()
+            if ratio >= 0.6:
+                score = ratio * 100
+        
+        if score > 0:
+            candidates.append({
+                "code": code,
+                "name": name,
+                "score": score,
+                "is_c": 1 if ('C' in name or 'c' in name) else 0
+            })
+    
+    if not candidates:
+        return {}
+    
+    # 排序：分数优先，相同分数C类优先
+    candidates.sort(key=lambda x: (x["score"], x["is_c"]), reverse=True)
+    best = candidates[0]
+    
+    # 调试输出
+    st.sidebar.write(f"🔍 {keyword} → {best['name']} (分数: {best['score']})")
+    return {"code": best["code"], "name": best["name"]}
 
-    # ---------- 第3级：清洗后匹配（保留字母数字中文）----------
-    def clean(text):
-        # 只保留中文、字母、数字，其他符号移除
-        return re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', text).lower()
-
-    clean_kw = clean(keyword)
-    for i, name in enumerate(names):
-        if clean_kw in clean(name):
-            return {"code": codes[i], "name": name}
-
-    # ---------- 第4级：提取核心关键词（基金公司+特征词）----------
-    # 例如从“建信新兴市场优选混合(QDII)C”中提取“建信新兴市场”
-    core_match = re.search(r'([\u4e00-\u9fa5]{2,4})(?:新兴|全球|纳斯达克|科创板|成长|价值|稳健)', keyword)
-    if core_match:
-        core = core_match.group(1)
-        for i, name in enumerate(names):
-            if core in name:
-                # 再次优先C类
-                if 'c' in name.lower() and 'c' in keyword.lower():
-                    return {"code": codes[i], "name": name}
-                else:
-                    # 暂存，不立即返回
-                    pass
-        # 如果没有C类偏好，返回第一个含核心词的
-        for i, name in enumerate(names):
-            if core in name:
-                return {"code": codes[i], "name": name}
-
-    # ---------- 第5级：difflib相似度匹配（仅当相似度>0.8）----------
-    best_ratio = 0
-    best_match = None
-    for i, name in enumerate(names):
-        ratio = difflib.SequenceMatcher(None, keyword.lower(), name.lower()).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_match = (codes[i], name)
-    if best_ratio > 0.8 and best_match:
-        return {"code": best_match[0], "name": best_match[1]}
-
-    # ---------- 第6级：用AkShare实时再搜一次（兜底）----------
-    try:
-        df_ak = ak.fund_name_em()
-        for _, row in df_ak.iterrows():
-            name_ak = row["基金简称"]
-            if clean_kw in clean(name_ak):
-                return {"code": row["基金代码"], "name": name_ak}
-    except:
-        pass
-
-    return {}
-
-# ---------------------- 百度OCR ----------------------
+# ---------------------- 百度OCR识别函数（含图片压缩）----------------------
 def get_baidu_access_token():
     url = "https://aip.baidubce.com/oauth/2.0/token"
     params = {
@@ -178,7 +183,7 @@ def ocr_image(image_file):
     except:
         return ""
 
-# ---------------------- DeepSeek AI ----------------------
+# ---------------------- DeepSeek AI 客户端 ----------------------
 def get_deepseek_client():
     return OpenAI(
         api_key=DEEPSEEK_API_KEY,
@@ -219,7 +224,7 @@ OCR文字内容：
     except:
         return []
 
-# ---------------------- 基金实时数据 ----------------------
+# ---------------------- 基金数据获取 ----------------------
 def get_fund_info(fund_code):
     url = f"http://fundgz.1234567.com.cn/js/{fund_code}.js"
     try:
@@ -397,7 +402,7 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理 ----------------------
+# ---------------------- 持仓管理（智能匹配）----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
@@ -411,6 +416,7 @@ elif page == "📁 持仓管理":
                     if funds_parsed:
                         st.success(f"识别到 {len(funds_parsed)} 只基金")
                         
+                        # 智能匹配代码
                         for fund in funds_parsed:
                             if "code" not in fund or not fund["code"]:
                                 matched = query_fund_code_smart(fund["name"])
