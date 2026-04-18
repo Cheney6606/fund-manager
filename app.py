@@ -14,6 +14,8 @@ from datetime import datetime
 SUPABASE_URL = "https://jwggzxbsbzvvbusjknbu.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp3Z2d6eGJzYnp2dmJ1c2prbmJ1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY0MTY1NTcsImV4cCI6MjA5MTk5MjU1N30.tXN1hJF8B8wB9iejrFEiEpcdTyveDRky0TM4FXrjfDg"
 DEEPSEEK_API_KEY = "sk-e4cfb4a5b57c429b818ad7c1115d1741"
+BAIDU_OCR_API_KEY = "lm6kOFEKbl9s7yu02WulwHwf"
+BAIDU_OCR_SECRET_KEY = "NYeQaq88oNs98rxXUPatTXEcreheN2Ml"
 # ====================================================================================
 
 # 初始化客户端（去掉了不兼容的参数）
