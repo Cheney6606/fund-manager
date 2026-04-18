@@ -29,7 +29,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="基金智能管理系统", layout="wide")
 st.title("📈 基金智能管理系统")
 
-# ---------------------- 【优化版】百度OCR（高精度优先，失败降级通用）----------------------
+# ---------------------- 百度OCR（高精度优先，失败降级通用）----------------------
 def get_baidu_access_token():
     url = "https://aip.baidubce.com/oauth/2.0/token"
     params = {
@@ -65,7 +65,7 @@ def ocr_image(image_file):
         st.error(f"图片处理失败: {e}")
         return ""
 
-    # 优先尝试高精度OCR，失败则降级通用OCR
+    # 优先高精度，失败降级通用
     for ocr_type, url in [("高精度", "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"),
                           ("通用", "https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic")]:
         try:
@@ -95,7 +95,7 @@ def ocr_image(image_file):
                 return ""
     return ""
 
-# ---------------------- 【优化版】DeepSeek AI 杜绝名称提取错误 ----------------------
+# ---------------------- DeepSeek AI 零脑补提取 ----------------------
 def get_deepseek_client():
     return OpenAI(
         api_key=DEEPSEEK_API_KEY,
@@ -155,7 +155,7 @@ OCR原始文字内容：
         st.sidebar.error(f"AI异常详情: {e}")
         return []
 
-# ---------------------- 【优化版】全量基金列表加载+标准化（含币种字段）----------------------
+# ---------------------- 全量基金列表加载+标准化（含币种字段）----------------------
 @st.cache_data(ttl=3600)
 def load_full_fund_list():
     raw_df = pd.DataFrame()
@@ -221,7 +221,7 @@ def load_full_fund_list():
     st.sidebar.success(f"✅ 基金列表标准化完成 (共{len(full_df)}只)")
     return full_df
 
-# ---------------------- 【重构版】智能匹配逻辑（币种强制+去冗余+兜底优化）----------------------
+# ---------------------- 智能匹配逻辑（币种强制+去冗余+兜底优化）----------------------
 def query_fund_code_smart(keyword: str) -> dict:
     if not keyword:
         return {}
@@ -318,7 +318,7 @@ def query_fund_code_smart(keyword: str) -> dict:
         debug_info.append(f"✅ 最佳匹配: {best['基金简称']} ({best['基金代码']})，相似度: {best['similarity']:.2f}")
     else:
         debug_info.append("❌ 强约束无匹配，启动兜底模糊匹配")
-        # 【优化】先筛选币种（如果明确非美元），再计算相似度排序
+        # 先筛选币种（如果明确非美元），再计算相似度排序
         fallback_df = full_df.copy()
         if kw_std["currency"] == "人民币":
             fallback_df = fallback_df[fallback_df["currency"] == "人民币"]
@@ -492,7 +492,7 @@ if page == "📊 持仓总览":
     except Exception as e:
         st.error(f"数据库错误：{e}")
 
-# ---------------------- 每日操作建议 ----------------------
+# ---------------------- 每日操作建议（已修复乱码）----------------------
 elif page == "📋 每日操作建议":
     st.header("📋 每日操作建议")
     try:
@@ -500,7 +500,7 @@ elif page == "📋 每日操作建议":
         df_portfolio = pd.DataFrame(res.data) if res.data else pd.DataFrame()
         if df_portfolio.empty:
             st.warning("请先添加持仓")
-        elif st.button("🚀 生成今日操作建议"):
+        elif st.button("🚀 生成今日操作建议", type="primary"):
             config = load_strategy_config()
             signals = []
             progress = st.progress(0)
@@ -516,7 +516,10 @@ elif page == "📋 每日操作建议":
             progress.empty()
             if signals:
                 for s in signals:
-                    st.warning(s) if "⚠️" in s else st.info(s)
+                    if "⚠️" in s:
+                        st.warning(s)
+                    else:
+                        st.info(s)
             else:
                 st.success("今日无触发操作，持有不动")
     except Exception as e:
@@ -595,7 +598,6 @@ elif page == "📁 持仓管理":
                                         "category": existing.iloc[0]["category"]
                                     }
                                 else:
-                                    # 【优化】自动估算份额和成本价（假设成本价 = 最新净值）
                                     info = get_fund_info(code)
                                     if info and info["net_value"] > 0:
                                         shares = market_value / info["net_value"]
