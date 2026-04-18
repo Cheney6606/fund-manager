@@ -282,80 +282,141 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理（含截图识别）----------------------
+# ---------------------- 持仓管理（智能更新版）----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
-    with st.expander("📸 上传支付宝持仓截图，自动识别导入", expanded=True):
+    # ---------- 截图识别 & 智能更新 ----------
+    with st.expander("📸 上传支付宝持仓截图，智能更新持仓", expanded=True):
         uploaded_file = st.file_uploader("选择截图", type=["png", "jpg", "jpeg"])
         if uploaded_file is not None:
             with st.spinner("OCR识别中..."):
                 ocr_text = ocr_image(uploaded_file)
                 if ocr_text:
-                    st.text_area("识别到的文字（可手动修正）", ocr_text, height=150)
-                    funds = parse_portfolio_from_ocr(ocr_text)
-                    if funds:
-                        st.success(f"识别到 {len(funds)} 只基金")
-                        df_preview = pd.DataFrame(funds)
-                        st.dataframe(df_preview)
-                        if st.button("✅ 确认导入到数据库"):
-                            for fund in funds:
-                                if "fund_code" in fund and "fund_name" in fund:
-                                    fund.setdefault("category", "盈利底仓")
-                                    fund.setdefault("shares", 0.0)
-                                    fund.setdefault("cost_price", 1.0)
-                                    fund.setdefault("buy_date", str(datetime.now().date()))
-                                    supabase.table("portfolio").upsert({
-                                        "fund_code": fund["fund_code"],
-                                        "fund_name": fund["fund_name"],
-                                        "category": fund["category"],
-                                        "shares": fund["shares"],
-                                        "cost_price": fund["cost_price"],
-                                        "buy_date": fund["buy_date"]
-                                    }, on_conflict="fund_code").execute()
-                            st.success("导入完成！")
+                    funds_parsed = parse_portfolio_from_ocr(ocr_text)
+                    if funds_parsed:
+                        st.success(f"识别到 {len(funds_parsed)} 只基金")
+                        
+                        # 获取现有持仓用于对比
+                        res_existing = supabase.table("portfolio").select("*").execute()
+                        df_existing = pd.DataFrame(res_existing.data) if res_existing.data else pd.DataFrame()
+                        
+                        # 构建预览数据，标记新增/更新
+                        preview_data = []
+                        for fund in funds_parsed:
+                            code = fund.get("fund_code", "")
+                            name = fund.get("fund_name", "")
+                            shares = fund.get("shares", 0.0)
+                            cost = fund.get("cost_price", 0.0)
+                            
+                            # 判断是否已存在
+                            existing = df_existing[df_existing["fund_code"] == code] if not df_existing.empty else pd.DataFrame()
+                            action = "更新" if not existing.empty else "新增"
+                            
+                            preview_data.append({
+                                "操作": action,
+                                "基金代码": code,
+                                "基金名称": name,
+                                "新份额": shares,
+                                "新成本价": cost,
+                                "原份额": existing.iloc[0]["shares"] if action == "更新" else "-",
+                                "原成本价": existing.iloc[0]["cost_price"] if action == "更新" else "-"
+                            })
+                        
+                        df_preview = pd.DataFrame(preview_data)
+                        st.dataframe(df_preview, use_container_width=True)
+                        
+                        if st.button("✅ 确认更新到我的持仓", type="primary"):
+                            for fund in funds_parsed:
+                                code = fund.get("fund_code")
+                                name = fund.get("fund_name")
+                                if not code or not name:
+                                    continue
+                                
+                                # 设置默认值
+                                category = "盈利底仓"  # 可后续手动调整
+                                shares = fund.get("shares", 0.0)
+                                cost = fund.get("cost_price", 0.0)
+                                buy_date = str(datetime.now().date())
+                                
+                                # 使用 upsert：存在则更新，不存在则插入
+                                supabase.table("portfolio").upsert({
+                                    "fund_code": code,
+                                    "fund_name": name,
+                                    "category": category,
+                                    "shares": shares,
+                                    "cost_price": cost,
+                                    "buy_date": buy_date
+                                }, on_conflict="fund_code").execute()
+                            
+                            st.success("持仓已更新！")
                             st.rerun()
+                    else:
+                        st.warning("未能从截图中解析出基金信息，请确保截图包含基金代码和持仓金额")
 
+    # ---------- 手动添加表单（保留）----------
     with st.expander("➕ 手动添加持仓"):
         col1, col2, col3 = st.columns(3)
         with col1:
-            code = st.text_input("基金代码")
+            new_code = st.text_input("基金代码")
         with col2:
-            name = st.text_input("基金名称")
+            new_name = st.text_input("基金名称")
         with col3:
-            category = st.selectbox("类型", ["盈利底仓", "亏损做T仓", "观察仓"])
+            new_category = st.selectbox("类型", ["盈利底仓", "亏损做T仓", "观察仓"])
         col4, col5, col6 = st.columns(3)
         with col4:
-            shares = st.number_input("份额", min_value=0.0, step=100.0)
+            new_shares = st.number_input("份额", min_value=0.0, step=100.0)
         with col5:
-            cost = st.number_input("成本价", min_value=0.0, step=0.0001, format="%.4f")
+            new_cost = st.number_input("成本价", min_value=0.0, step=0.0001, format="%.4f")
         with col6:
-            buy_date = st.date_input("买入日期")
+            new_date = st.date_input("买入日期")
         if st.button("添加持仓"):
-            if code and name:
+            if new_code and new_name:
                 supabase.table("portfolio").upsert({
-                    "fund_code": code, "fund_name": name, "category": category,
-                    "shares": shares, "cost_price": cost, "buy_date": str(buy_date)
+                    "fund_code": new_code,
+                    "fund_name": new_name,
+                    "category": new_category,
+                    "shares": new_shares,
+                    "cost_price": new_cost,
+                    "buy_date": str(new_date)
                 }, on_conflict="fund_code").execute()
                 st.success("已添加")
                 st.rerun()
 
+    # ---------- 当前持仓编辑 ----------
     st.subheader("当前持仓")
     try:
         res = supabase.table("portfolio").select("*").execute()
-        df = pd.DataFrame(res.data) if res.data else pd.DataFrame()
+        df = pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=["fund_code", "fund_name", "category", "shares", "cost_price", "buy_date"])
         if not df.empty:
-            edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, key="editor")
+            edited_df = st.data_editor(
+                df,
+                num_rows="dynamic",
+                column_config={
+                    "fund_code": "基金代码",
+                    "fund_name": "基金名称",
+                    "category": "类型",
+                    "shares": st.column_config.NumberColumn("份额", format="%.2f"),
+                    "cost_price": st.column_config.NumberColumn("成本", format="%.4f"),
+                    "buy_date": "日期"
+                },
+                use_container_width=True
+            )
             if st.button("💾 保存修改"):
-                for _, row in edited.iterrows():
+                for _, row in edited_df.iterrows():
                     supabase.table("portfolio").update({
-                        "fund_name": row["fund_name"], "category": row["category"],
-                        "shares": row["shares"], "cost_price": row["cost_price"], "buy_date": row["buy_date"]
+                        "fund_name": row["fund_name"],
+                        "category": row["category"],
+                        "shares": row["shares"],
+                        "cost_price": row["cost_price"],
+                        "buy_date": row["buy_date"]
                     }).eq("fund_code", row["fund_code"]).execute()
-                st.success("已保存")
+                st.success("✅ 保存成功")
                 st.rerun()
+        else:
+            st.info("暂无持仓")
     except Exception as e:
-        st.error(f"读取失败：{e}")
+        st.error(f"读取持仓失败：{e}")
 
 # ---------------------- 策略配置 ----------------------
 elif page == "⚙️ 策略参数配置":
