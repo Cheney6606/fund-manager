@@ -329,7 +329,7 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理（智能更新版 - 列表页优化）----------------------
+# ---------------------- 持仓管理（AI解析版）----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
@@ -339,8 +339,8 @@ elif page == "📁 持仓管理":
             with st.spinner("OCR识别中..."):
                 ocr_text = ocr_image(uploaded_file)
                 if ocr_text:
-                    # 使用新的列表页解析函数
-                    funds_parsed = parse_portfolio_list_from_text(ocr_text)
+                    # 使用AI解析
+                    funds_parsed = parse_portfolio_by_ai(ocr_text)
                     if funds_parsed:
                         st.success(f"识别到 {len(funds_parsed)} 只基金")
                         
@@ -386,10 +386,8 @@ elif page == "📁 持仓管理":
                                 if not code or not name:
                                     continue
                                 
-                                # 查询现有数据
                                 existing = df_existing[df_existing["fund_code"] == code] if not df_existing.empty else pd.DataFrame()
                                 if not existing.empty:
-                                    # 更新：保留原有份额和成本价，只更新市值不影响核心字段
                                     update_dict = {
                                         "fund_code": code,
                                         "fund_name": name,
@@ -398,7 +396,6 @@ elif page == "📁 持仓管理":
                                         "category": existing.iloc[0]["category"]
                                     }
                                 else:
-                                    # 新增：需要用户后续手动补充份额成本
                                     update_dict = {
                                         "fund_code": code,
                                         "fund_name": name,
@@ -410,8 +407,9 @@ elif page == "📁 持仓管理":
                             st.success("持仓已更新！")
                             st.rerun()
                     else:
-                        st.warning("未能从截图中解析出基金信息，请确保是支付宝持仓列表截图")
+                        st.warning("未能从截图中解析出基金信息")
 
+    # 后续手动添加表单和当前持仓编辑保持不变...
     with st.expander("➕ 手动添加持仓"):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -466,7 +464,6 @@ elif page == "📁 持仓管理":
             st.info("暂无持仓")
     except Exception as e:
         st.error(f"读取持仓失败：{e}")
-
 # ---------------------- 策略配置 ----------------------
 elif page == "⚙️ 策略参数配置":
     st.header("⚙️ 策略参数")
