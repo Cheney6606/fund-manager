@@ -65,7 +65,6 @@ def ocr_image(image_file):
         st.error(f"图片处理失败: {e}")
         return ""
 
-    # 使用高精度OCR，解决分行、小字识别问题
     url = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
     params = {"access_token": access_token}
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
@@ -145,7 +144,7 @@ OCR原始文字内容：
         st.sidebar.error(f"AI异常详情: {e}")
         return []
 
-# ---------------------- 【优化版】全量基金列表加载+标准化 ----------------------
+# ---------------------- 【优化版】全量基金列表加载+标准化（含币种字段）----------------------
 @st.cache_data(ttl=3600)
 def load_full_fund_list():
     raw_df = pd.DataFrame()
@@ -171,7 +170,6 @@ def load_full_fund_list():
             st.sidebar.error(f"❌ AkShare获取失败: {e}")
             return pd.DataFrame()
 
-    # 提前标准化基金名称，提取核心要素
     def standardize_fund_name(full_name):
         name = str(full_name)
         name = name.translate(str.maketrans('（）【】', '()[]'))
@@ -191,17 +189,21 @@ def load_full_fund_list():
             fund_type = "混合"
         elif "股票" in name:
             fund_type = "股票"
+        # 提取币种（人民币/美元）
+        currency = "美元" if "美元" in name else "人民币"
         core_target = name
         core_target = re.sub(r'^(' + '|'.join(company_list) + ')', '', core_target)
-        core_target = re.sub(r'(混合|ETF联接|指数增强|股票|QDII|A类|C类|A|C|\(|\)|\s)', '', core_target)
+        core_target = re.sub(r'(混合|ETF联接|指数增强|股票|QDII|A类|C类|A|C|发起式|美元|人民币|\(|\)|\s)', '', core_target)
         clean_name = re.sub(r'[\(\)\[\]\s\-_\.，,。·]', '', name).lower()
         return {
             "company": company,
             "share_type": share_type,
             "fund_type": fund_type,
+            "currency": currency,
             "core_target": core_target,
             "clean_name": clean_name,
-            "original_name": name
+            "original_name": name,
+            "name_length": len(name)
         }
 
     standardize_result = raw_df["基金简称"].apply(standardize_fund_name).apply(pd.Series)
@@ -209,7 +211,7 @@ def load_full_fund_list():
     st.sidebar.success(f"✅ 基金列表标准化完成 (共{len(full_df)}只)")
     return full_df
 
-# ---------------------- 【重构版】智能匹配逻辑 强约束+零错配 ----------------------
+# ---------------------- 【重构版】智能匹配逻辑（币种强制+去冗余）----------------------
 def query_fund_code_smart(keyword: str) -> dict:
     if not keyword:
         return {}
@@ -230,7 +232,7 @@ def query_fund_code_smart(keyword: str) -> dict:
             st.sidebar.success(f"🎯 6位代码精确匹配: {row['基金简称']} ({row['基金代码']})")
             return {"code": row["基金代码"], "name": row["基金简称"]}
 
-    # 2. 关键词标准化
+    # 2. 关键词标准化（含币种）
     def standardize_keyword(kw):
         kw = str(kw)
         kw = kw.translate(str.maketrans('（）【】', '()[]'))
@@ -250,14 +252,16 @@ def query_fund_code_smart(keyword: str) -> dict:
             fund_type = "混合"
         elif "股票" in kw:
             fund_type = "股票"
+        currency = "美元" if "美元" in kw else "人民币"
         core_target = kw
         core_target = re.sub(r'^(' + '|'.join(company_list) + ')', '', core_target)
-        core_target = re.sub(r'(混合|ETF联接|指数增强|股票|QDII|A类|C类|A|C|\(|\)|\s)', '', core_target)
+        core_target = re.sub(r'(混合|ETF联接|指数增强|股票|QDII|A类|C类|A|C|发起式|美元|人民币|\(|\)|\s)', '', core_target)
         clean_kw = re.sub(r'[\(\)\[\]\s\-_\.，,。·]', '', kw).lower()
         return {
             "company": company,
             "share_type": share_type,
             "fund_type": fund_type,
+            "currency": currency,
             "core_target": core_target,
             "clean_kw": clean_kw
         }
@@ -266,10 +270,10 @@ def query_fund_code_smart(keyword: str) -> dict:
     debug_info.append(f"🔹 提取公司: {kw_std['company']}")
     debug_info.append(f"🔹 提取份额类型: {kw_std['share_type']}")
     debug_info.append(f"🔹 提取基金类型: {kw_std['fund_type']}")
+    debug_info.append(f"🔹 提取币种: {kw_std['currency']}")
     debug_info.append(f"🔹 提取核心标的: {kw_std['core_target']}")
-    debug_info.append(f"🔹 清洗后关键词: {kw_std['clean_kw']}")
 
-    # 3. 强约束筛选
+    # 3. 强约束筛选（含币种强制匹配）
     candidates = full_df.copy()
     if kw_std["company"]:
         candidates = candidates[candidates["company"] == kw_std["company"]]
@@ -277,6 +281,11 @@ def query_fund_code_smart(keyword: str) -> dict:
     
     candidates = candidates[candidates["share_type"] == kw_std["share_type"]]
     debug_info.append(f"✅ 份额类型筛选后剩余: {len(candidates)} 只")
+    
+    # 强制币种匹配：如果用户输入不含“美元”，只匹配人民币份额
+    if kw_std["currency"] == "人民币":
+        candidates = candidates[candidates["currency"] == "人民币"]
+        debug_info.append(f"✅ 币种筛选（强制人民币）后剩余: {len(candidates)} 只")
     
     if kw_std["fund_type"]:
         candidates = candidates[candidates["fund_type"] == kw_std["fund_type"]]
@@ -291,12 +300,13 @@ def query_fund_code_smart(keyword: str) -> dict:
         candidates["similarity"] = candidates["clean_name"].apply(
             lambda x: difflib.SequenceMatcher(None, kw_std["clean_kw"], x).ratio()
         )
-        candidates = candidates.sort_values("similarity", ascending=False)
+        # 排序：相似度优先，相同相似度时名称更短优先（去除冗余后缀）
+        candidates = candidates.sort_values(["similarity", "name_length"], ascending=[False, True])
         
         st.sidebar.markdown("---")
         st.sidebar.subheader("🎯 最终匹配候选列表")
-        show_cols = ["基金代码", "基金简称", "similarity", "core_target"]
-        st.sidebar.dataframe(candidates[show_cols].rename(columns={"similarity": "相似度"}), use_container_width=True)
+        show_cols = ["基金代码", "基金简称", "similarity", "currency", "core_target", "name_length"]
+        st.sidebar.dataframe(candidates[show_cols].rename(columns={"similarity": "相似度", "currency": "币种", "name_length": "名称长度"}), use_container_width=True)
         
         best = candidates.iloc[0]
         result = {"code": best["基金代码"], "name": best["基金简称"]}
@@ -306,10 +316,13 @@ def query_fund_code_smart(keyword: str) -> dict:
         full_df["similarity"] = full_df["clean_name"].apply(
             lambda x: difflib.SequenceMatcher(None, kw_std["clean_kw"], x).ratio()
         )
-        full_df = full_df.sort_values("similarity", ascending=False)
+        full_df = full_df.sort_values(["similarity", "name_length"], ascending=[False, True])
+        # 兜底时也强制币种（如果明确非美元）
+        if kw_std["currency"] == "人民币":
+            full_df = full_df[full_df["currency"] == "人民币"]
         top_3 = full_df.head(3)
         st.sidebar.subheader("⚠️ 兜底匹配Top3")
-        st.sidebar.dataframe(top_3[["基金代码", "基金简称", "similarity"]], use_container_width=True)
+        st.sidebar.dataframe(top_3[["基金代码", "基金简称", "similarity", "currency"]], use_container_width=True)
         
         best = top_3.iloc[0]
         if best["similarity"] > 0.6:
