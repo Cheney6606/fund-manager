@@ -27,96 +27,86 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="基金智能管理系统", layout="wide")
 st.title("📈 基金智能管理系统")
 
-# ---------------------- 调试信息：显示当前目录文件 ----------------------
-st.sidebar.subheader("📁 部署环境文件列表")
+# ---------------------- 调试信息 ----------------------
+st.sidebar.subheader("📁 部署环境")
 file_list = os.listdir('.')
-st.sidebar.write(file_list)
 csv_exists = os.path.exists("fund_full_list.csv")
 st.sidebar.write(f"fund_full_list.csv 存在: {csv_exists}")
 
-# ---------------------- 全量基金列表（CSV优先，AkShare降级）----------------------
+# ---------------------- 全量基金列表 ----------------------
 @st.cache_data(ttl=3600)
 def load_full_fund_list():
-    """加载全市场基金列表，优先CSV，失败则用AkShare实时获取"""
-    # 1. 尝试读取本地CSV
     if os.path.exists("fund_full_list.csv"):
         try:
             df = pd.read_csv("fund_full_list.csv", dtype={"基金代码": str})
             if not df.empty:
-                st.sidebar.success("✅ 使用本地CSV文件")
+                st.sidebar.success("✅ 使用本地CSV")
                 return df
-        except Exception as e:
-            st.sidebar.warning(f"读取CSV失败: {e}")
-    
-    # 2. 降级：使用AkShare实时获取
-    st.sidebar.info("🔄 降级使用AkShare实时获取基金列表...")
+        except:
+            pass
+    st.sidebar.info("🔄 降级使用AkShare")
     try:
         df = ak.fund_name_em()
-        df = df[["基金代码", "基金简称"]].copy()
-        return df
-    except Exception as e:
-        st.sidebar.error(f"AkShare获取失败: {e}")
+        return df[["基金代码", "基金简称"]].copy()
+    except:
         return pd.DataFrame(columns=["基金代码", "基金简称"])
 
-def query_fund_code(keyword: str) -> dict:
-    """增强版模糊匹配，多重容错"""
+def query_fund_code_smart(keyword: str) -> dict:
+    """智能匹配：优先C类份额，加权评分"""
     if not keyword:
         return {}
     df = load_full_fund_list()
     if df.empty:
         return {}
     
-    # 原始名称列
-    names = df["基金简称"].astype(str).tolist()
-    codes = df["基金代码"].astype(str).tolist()
+    st.sidebar.write(f"🔍 正在匹配: {keyword}")
     
-    # 1. 精确匹配
-    for i, name in enumerate(names):
-        if keyword == name:
-            return {"code": codes[i], "name": name}
+    # 清洗原始名称，用于构建关键词
+    clean_kw = re.sub(r'[\(\)\s\-_]', '', keyword).lower()
+    # 提取中文核心部分（去除英文字母和数字后的纯中文）
+    chinese_core = re.sub(r'[^\u4e00-\u9fa5]', '', keyword)
     
-    # 2. 忽略大小写包含匹配
-    kw_lower = keyword.lower()
-    for i, name in enumerate(names):
-        if kw_lower in name.lower():
-            return {"code": codes[i], "name": name}
+    candidates = []
+    for _, row in df.iterrows():
+        code = row["基金代码"]
+        name = row["基金简称"]
+        name_clean = re.sub(r'[\(\)\s\-_]', '', name).lower()
+        
+        # 评分规则
+        score = 0
+        # 1. 名称包含关系
+        if clean_kw in name_clean:
+            score += 50
+        elif name_clean in clean_kw:
+            score += 40
+        # 2. 核心中文完全匹配
+        if chinese_core and chinese_core in re.sub(r'[^\u4e00-\u9fa5]', '', name):
+            score += 30
+        # 3. 优先C类份额
+        if 'C' in keyword or 'C类' in keyword:
+            if 'C' in name or 'C类' in name:
+                score += 20
+        # 4. 长度相似度（防止匹配到过长或过短的名称）
+        len_diff = abs(len(name) - len(keyword))
+        if len_diff < 5:
+            score += 10
+        elif len_diff < 10:
+            score += 5
+        
+        if score > 0:
+            candidates.append((score, code, name))
     
-    # 3. 清洗后匹配：移除括号、空格、特殊符号
-    def clean(text):
-        return re.sub(r'[\(\)\s\-_（)）]', '', text).lower()
-    clean_kw = clean(keyword)
-    for i, name in enumerate(names):
-        if clean_kw in clean(name):
-            return {"code": codes[i], "name": name}
+    if not candidates:
+        st.sidebar.warning("未找到任何候选")
+        return {}
     
-    # 4. 只保留中文和数字匹配
-    def extract_cn_num(text):
-        return re.sub(r'[^\u4e00-\u9fa50-9]', '', text)
-    cn_kw = extract_cn_num(keyword)
-    for i, name in enumerate(names):
-        if cn_kw and cn_kw in extract_cn_num(name):
-            return {"code": codes[i], "name": name}
-    
-    # 5. 提取基金公司 + 核心词（如“建信新兴市场”）
-    core_match = re.search(r'([\u4e00-\u9fa5]{2,6})(?:新兴|全球|纳斯达克|科创板|成长)', keyword)
-    if core_match:
-        core = core_match.group(1)
-        for i, name in enumerate(names):
-            if core in name:
-                return {"code": codes[i], "name": name}
-    
-    # 6. 最后尝试用 AkShare 实时接口再搜一次（兜底）
-    try:
-        df_ak = ak.fund_name_em()
-        for _, row in df_ak.iterrows():
-            if clean_kw in clean(row["基金简称"]):
-                return {"code": row["基金代码"], "name": row["基金简称"]}
-    except:
-        pass
-    
-    return {}
+    # 按评分排序，取最高分
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best = candidates[0]
+    st.sidebar.write(f"✅ 最佳匹配 (评分{best[0]}): {best[2]} ({best[1]})")
+    return {"code": best[1], "name": best[2]}
 
-# ---------------------- 百度OCR识别函数（含图片压缩）----------------------
+# ---------------------- 百度OCR ----------------------
 def get_baidu_access_token():
     url = "https://aip.baidubce.com/oauth/2.0/token"
     params = {
@@ -158,7 +148,7 @@ def ocr_image(image_file):
     except:
         return ""
 
-# ---------------------- DeepSeek AI 客户端 ----------------------
+# ---------------------- DeepSeek AI ----------------------
 def get_deepseek_client():
     return OpenAI(
         api_key=DEEPSEEK_API_KEY,
@@ -199,7 +189,7 @@ OCR文字内容：
     except:
         return []
 
-# ---------------------- 基金数据获取 ----------------------
+# ---------------------- 基金实时数据 ----------------------
 def get_fund_info(fund_code):
     url = f"http://fundgz.1234567.com.cn/js/{fund_code}.js"
     try:
@@ -377,7 +367,7 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理（CSV优先 + AkShare降级）----------------------
+# ---------------------- 持仓管理 ----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
@@ -391,10 +381,9 @@ elif page == "📁 持仓管理":
                     if funds_parsed:
                         st.success(f"识别到 {len(funds_parsed)} 只基金")
                         
-                        # 查询代码
                         for fund in funds_parsed:
                             if "code" not in fund or not fund["code"]:
-                                matched = query_fund_code(fund["name"])
+                                matched = query_fund_code_smart(fund["name"])
                                 if matched:
                                     fund["code"] = matched["code"]
                                     fund["name"] = matched["name"]
