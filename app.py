@@ -6,26 +6,29 @@ import re
 import time
 import plotly.graph_objects as go
 import numpy as np
-from openai import OpenAI
+from openai import OpenAI, Timeout
 from supabase import create_client, Client
 from datetime import datetime
 import base64
 from PIL import Image
 import io
+import akshare as ak
 
-# ====================== 已填入真实 Key ======================
-SUPABASE_URL = "https://jwggzxbsbzvvbusjknbu.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp3Z2d6eGJzYnp2dmJ1c2prbmJ1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY0MTY1NTcsImV4cCI6MjA5MTk5MjU1N30.tXN1hJF8B8wB9iejrFEiEpcdTyveDRky0TM4FXrjfDg"
-DEEPSEEK_API_KEY = "sk-e4cfb4a5b57c429b818ad7c1115d1741"
-BAIDU_OCR_API_KEY = "lm6kOFEKbl9s7yu02WulwHwf"
-BAIDU_OCR_SECRET_KEY = "NYeQaq88oNs98rxXUPatTXEcreheN2Ml"
-# ============================================================
+# ====================== 使用 Streamlit Secrets 管理密钥 ======================
+# 请在 Streamlit Cloud 的 Settings -> Secrets 中添加以下内容：
+# SUPABASE_URL, SUPABASE_KEY, DEEPSEEK_API_KEY, BAIDU_OCR_API_KEY, BAIDU_OCR_SECRET_KEY
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
+BAIDU_OCR_API_KEY = st.secrets["BAIDU_OCR_API_KEY"]
+BAIDU_OCR_SECRET_KEY = st.secrets["BAIDU_OCR_SECRET_KEY"]
+# =============================================================================
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="基金智能管理系统", layout="wide")
 st.title("📈 基金智能管理系统")
 
-# ---------------------- 百度OCR识别函数 ----------------------
+# ---------------------- 百度OCR识别函数（含图片压缩）----------------------
 def get_baidu_access_token():
     url = "https://aip.baidubce.com/oauth/2.0/token"
     params = {
@@ -34,41 +37,56 @@ def get_baidu_access_token():
         "client_secret": BAIDU_OCR_SECRET_KEY
     }
     try:
-        response = requests.post(url, params=params)
+        response = requests.post(url, params=params, timeout=10)
         return response.json().get("access_token")
-    except:
+    except Exception as e:
+        st.error(f"百度OCR token获取失败：{e}")
         return None
 
 def ocr_image(image_file):
     access_token = get_baidu_access_token()
     if not access_token:
-        st.error("百度OCR token获取失败，请检查API Key")
         return ""
-    img = Image.open(image_file)
-    buffered = io.BytesIO()
-    img.save(buffered, format="PNG")
-    img_base64 = base64.b64encode(buffered.getvalue()).decode()
+    try:
+        img = Image.open(image_file)
+        # 压缩图片避免参数错误
+        img.thumbnail((1024, 1024))
+        buffered = io.BytesIO()
+        img.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+    except Exception as e:
+        st.error(f"图片处理失败：{e}")
+        return ""
+
     url = "https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic"
     params = {"access_token": access_token}
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     data = {"image": img_base64}
     try:
-        response = requests.post(url, params=params, headers=headers, data=data)
+        response = requests.post(url, params=params, headers=headers, data=data, timeout=15)
         result = response.json()
         if "words_result" in result:
             words = [item["words"] for item in result["words_result"]]
             return "\n".join(words)
         else:
-            st.error(f"OCR识别失败：{result}")
+            st.error(f"OCR识别失败：{result.get('error_msg', '未知错误')}")
             return ""
     except Exception as e:
         st.error(f"OCR请求异常：{e}")
         return ""
 
-# ---------------------- DeepSeek AI 补全函数（增强版）----------------------
+# ---------------------- DeepSeek AI 客户端（含超时和重试）----------------------
+def get_deepseek_client():
+    return OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com",
+        timeout=Timeout(30.0, connect=10.0, read=30.0),
+        max_retries=2
+    )
+
 def query_fund_code_by_name(name: str) -> dict:
     """根据基金名称查询代码，返回 {"code": "xxxxxx", "name": "标准名称"}"""
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+    client = get_deepseek_client()
     prompt = f"""请查询基金名称为"{name}"的6位数字代码。只返回一个JSON：{{"code": "xxxxxx", "name": "基金全称"}}。如果找不到，code留空。不要输出任何其他文字。"""
     try:
         response = client.chat.completions.create(
@@ -82,71 +100,46 @@ def query_fund_code_by_name(name: str) -> dict:
         if json_match:
             return json.loads(json_match.group())
         return {}
-    except:
+    except Exception as e:
+        st.error(f"AI查询代码失败：{e}")
         return {}
 
-# ---------------------- 全新解析函数（针对列表页格式）----------------------
-def parse_portfolio_list_from_text(text):
-    """
-    专为支付宝持仓列表页设计。
-    格式特点：基金名称一行，下方紧随持仓金额（带逗号的数字），再下方是盈亏数据。
-    返回列表，每个元素为 {"name": xxx, "market_value": xxx}
-    """
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    funds = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        # 判断是否为基金名称行：包含常见基金特征词，且不含纯数字或特殊符号
-        if any(kw in line for kw in ["混合", "ETF", "联接", "指数", "股票", "债券", "QDII", "优选", "成长", "价值", "灵活", "稳健"]):
-            # 过滤掉干扰行（如"市场解读"）
-            if "市场解读" in line or "金选" in line and "基金" in line:
-                i += 1
-                continue
-            
-            name = re.sub(r'金选指数基金|定投|市场解读.*', '', line).strip()
-            if len(name) < 3:
-                i += 1
-                continue
-            
-            # 找下一行的金额（通常是带逗号的大数字）
-            market_value = None
-            j = i + 1
-            while j < len(lines) and j < i + 5:
-                num_line = lines[j]
-                # 匹配金额格式（如 47,271.80 或 11,307.83）
-                num_match = re.search(r'([\d,]+\.\d{2})', num_line)
-                if num_match:
-                    try:
-                        val = float(num_match.group(1).replace(",", ""))
-                        if val > 100:  # 有效持仓金额
-                            market_value = val
-                            break
-                    except:
-                        pass
-                j += 1
-            
-            if market_value:
-                funds.append({
-                    "name": name,
-                    "market_value": market_value
-                })
-                i = j  # 跳过已处理的行
-            else:
-                i += 1
-        else:
-            i += 1
-    
-    # 去重（根据名称）
-    seen = set()
-    unique_funds = []
-    for f in funds:
-        if f["name"] not in seen:
-            seen.add(f["name"])
-            unique_funds.append(f)
-    return unique_funds
+def parse_portfolio_by_ai(ocr_text: str) -> list:
+    """使用DeepSeek从OCR文字中提取基金名称和持仓金额"""
+    client = get_deepseek_client()
+    prompt = f"""
+请从以下支付宝基金持仓页面的OCR识别文字中，提取所有基金的信息。
+文字中包含多只基金，每只基金通常由“基金名称”和“持仓金额”组成。
+请忽略“市场解读”、“定投”、“昨日收益”、“持有收益”等无关内容，只提取基金名称和对应的持仓金额（单位：元）。
 
-# ---------------------- 原有基金数据函数 ----------------------
+返回一个纯JSON数组，每个元素为：
+{{"name": "基金完整名称", "market_value": 金额数字}}
+
+如果文字中没有基金信息，返回空数组[]。
+不要输出任何其他文字或解释。
+
+OCR文字内容：
+{ocr_text}
+"""
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+            temperature=0
+        )
+        content = response.choices[0].message.content.strip()
+        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+        if json_match:
+            funds = json.loads(json_match.group())
+            funds = [f for f in funds if f.get("market_value", 0) > 1000]
+            return funds
+        return []
+    except Exception as e:
+        st.error(f"AI解析失败：{e}")
+        return []
+
+# ---------------------- 基金数据获取（修复历史净值接口）----------------------
 def get_fund_info(fund_code):
     url = f"http://fundgz.1234567.com.cn/js/{fund_code}.js"
     try:
@@ -162,27 +155,25 @@ def get_fund_info(fund_code):
             "estimate_change": float(data.get("gszzl", 0)),
             "update_time": data.get("jzrq", "")
         }
-    except:
+    except Exception as e:
+        st.error(f"获取基金{fund_code}实时数据失败：{e}")
         return None
 
 def get_historical_nav(fund_code, days=365):
-    url = f"http://fund.eastmoney.com/pingzhongdata/{fund_code}.js"
+    """使用 AkShare 获取历史净值，稳定可靠"""
     try:
-        response = requests.get(url, timeout=10)
-        text = response.text
-        pattern = r'var Data_netWorthTrend = (\[.*?\]);'
-        match = re.search(pattern, text)
-        if not match:
+        df = ak.fund_open_fund_info_em(symbol=fund_code, indicator="单位净值走势")
+        if df.empty:
             return None
-        data = json.loads(match.group(1))
-        df = pd.DataFrame(data)
-        df = df[["x", "y"]].rename(columns={"x": "date", "y": "nav"})
-        df["date"] = pd.to_datetime(df["date"], unit='ms')
+        df = df[["净值日期", "单位净值"]].rename(columns={"净值日期": "date", "单位净值": "nav"})
+        df["date"] = pd.to_datetime(df["date"])
         df = df[df["date"] >= df["date"].max() - pd.Timedelta(days=days)]
         return df.sort_values("date")
-    except:
+    except Exception as e:
+        st.error(f"获取历史净值失败（{fund_code}）：{e}")
         return None
 
+# ---------------------- 指标计算 ----------------------
 def calculate_metrics(nav_df):
     if nav_df is None or len(nav_df) < 2:
         return {}
@@ -244,11 +235,12 @@ def load_strategy_config():
     try:
         res = supabase.table("strategy_config").select("*").execute()
         return {row["rule_name"]: row["rule_value"] for row in res.data} if res.data else {"T_SELL_THRESHOLD": 2.0}
-    except:
+    except Exception as e:
+        st.error(f"加载策略配置失败：{e}")
         return {"T_SELL_THRESHOLD": 2.0}
 
 def ai_chat(messages, funds_context):
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+    client = get_deepseek_client()
     system_prompt = f"你是专属我的基金分析师，基于以下持仓数据回答问题：\n{funds_context}"
     full_messages = [{"role": "system", "content": system_prompt}] + messages
     try:
@@ -339,7 +331,6 @@ elif page == "📁 持仓管理":
             with st.spinner("OCR识别中..."):
                 ocr_text = ocr_image(uploaded_file)
                 if ocr_text:
-                    # 使用AI解析
                     funds_parsed = parse_portfolio_by_ai(ocr_text)
                     if funds_parsed:
                         st.success(f"识别到 {len(funds_parsed)} 只基金")
@@ -352,7 +343,6 @@ elif page == "📁 持仓管理":
                                 if ai_result.get("name"):
                                     fund["name"] = ai_result["name"]
                         
-                        # 获取现有持仓
                         res_existing = supabase.table("portfolio").select("*").execute()
                         df_existing = pd.DataFrame(res_existing.data) if res_existing.data else pd.DataFrame()
                         
@@ -385,7 +375,6 @@ elif page == "📁 持仓管理":
                                 name = fund["name"]
                                 if not code or not name:
                                     continue
-                                
                                 existing = df_existing[df_existing["fund_code"] == code] if not df_existing.empty else pd.DataFrame()
                                 if not existing.empty:
                                     update_dict = {
@@ -409,7 +398,6 @@ elif page == "📁 持仓管理":
                     else:
                         st.warning("未能从截图中解析出基金信息")
 
-    # 后续手动添加表单和当前持仓编辑保持不变...
     with st.expander("➕ 手动添加持仓"):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -464,6 +452,7 @@ elif page == "📁 持仓管理":
             st.info("暂无持仓")
     except Exception as e:
         st.error(f"读取持仓失败：{e}")
+
 # ---------------------- 策略配置 ----------------------
 elif page == "⚙️ 策略参数配置":
     st.header("⚙️ 策略参数")
@@ -477,8 +466,8 @@ elif page == "⚙️ 策略参数配置":
                     supabase.table("strategy_config").update({"rule_value": row["rule_value"]}).eq("rule_name", row["rule_name"]).execute()
                 st.success("已更新")
                 st.rerun()
-    except:
-        st.info("配置表暂不可用")
+    except Exception as e:
+        st.info(f"配置表暂不可用：{e}")
 
 # ---------------------- AI对话 ----------------------
 elif page == "🤖 AI基金分析师":
