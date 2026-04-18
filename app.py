@@ -27,29 +27,46 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="基金智能管理系统", layout="wide")
 st.title("📈 基金智能管理系统")
 
-# ---------------------- 全量基金列表（适配带引号文件名）----------------------
-FULL_LIST_FILE = "fund_full_list.csv"
+# ---------------------- 调试信息：显示当前目录文件 ----------------------
+st.sidebar.subheader("📁 部署环境文件列表")
+file_list = os.listdir('.')
+st.sidebar.write(file_list)
+csv_exists = os.path.exists("fund_full_list.csv")
+st.sidebar.write(f"fund_full_list.csv 存在: {csv_exists}")
 
-@st.cache_data(ttl=86400)
+# ---------------------- 全量基金列表（CSV优先，AkShare降级）----------------------
+@st.cache_data(ttl=3600)
 def load_full_fund_list():
-    """加载全市场基金列表 CSV"""
+    """加载全市场基金列表，优先CSV，失败则用AkShare实时获取"""
+    # 1. 尝试读取本地CSV
+    if os.path.exists("fund_full_list.csv"):
+        try:
+            df = pd.read_csv("fund_full_list.csv", dtype={"基金代码": str})
+            if not df.empty:
+                st.sidebar.success("✅ 使用本地CSV文件")
+                return df
+        except Exception as e:
+            st.sidebar.warning(f"读取CSV失败: {e}")
+    
+    # 2. 降级：使用AkShare实时获取
+    st.sidebar.info("🔄 降级使用AkShare实时获取基金列表...")
     try:
-        df = pd.read_csv(FULL_LIST_FILE, dtype={"基金代码": str})
+        df = ak.fund_name_em()
+        df = df[["基金代码", "基金简称"]].copy()
         return df
     except Exception as e:
-        st.error(f"读取全量基金列表失败：{e}")
+        st.sidebar.error(f"AkShare获取失败: {e}")
         return pd.DataFrame(columns=["基金代码", "基金简称"])
 
 def query_fund_code(keyword: str) -> dict:
-    """在全量 CSV 中模糊匹配基金代码"""
+    """在全量列表中模糊匹配基金代码"""
     if not keyword:
         return {}
     df = load_full_fund_list()
     if df.empty:
         return {}
-    # 清洗关键词，提高匹配率
+    
     clean_kw = keyword.replace("(QDII)", "").replace("QDII", "").replace("C类", "").replace("C", "").strip()
-    # 先尝试清洗后匹配
     mask = df["基金简称"].str.contains(clean_kw, case=False, na=False)
     if not mask.any():
         mask = df["基金简称"].str.contains(keyword, case=False, na=False)
@@ -100,7 +117,7 @@ def ocr_image(image_file):
     except:
         return ""
 
-# ---------------------- DeepSeek AI 客户端（含超时和重试）----------------------
+# ---------------------- DeepSeek AI 客户端 ----------------------
 def get_deepseek_client():
     return OpenAI(
         api_key=DEEPSEEK_API_KEY,
@@ -319,7 +336,7 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理（全量CSV查询）----------------------
+# ---------------------- 持仓管理（CSV优先 + AkShare降级）----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
@@ -333,7 +350,7 @@ elif page == "📁 持仓管理":
                     if funds_parsed:
                         st.success(f"识别到 {len(funds_parsed)} 只基金")
                         
-                        # 查询代码：全量CSV模糊匹配
+                        # 查询代码
                         for fund in funds_parsed:
                             if "code" not in fund or not fund["code"]:
                                 matched = query_fund_code(fund["name"])
