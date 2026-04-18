@@ -59,20 +59,61 @@ def load_full_fund_list():
         return pd.DataFrame(columns=["基金代码", "基金简称"])
 
 def query_fund_code(keyword: str) -> dict:
-    """在全量列表中模糊匹配基金代码"""
+    """增强版模糊匹配，多重容错"""
     if not keyword:
         return {}
     df = load_full_fund_list()
     if df.empty:
         return {}
     
-    clean_kw = keyword.replace("(QDII)", "").replace("QDII", "").replace("C类", "").replace("C", "").strip()
-    mask = df["基金简称"].str.contains(clean_kw, case=False, na=False)
-    if not mask.any():
-        mask = df["基金简称"].str.contains(keyword, case=False, na=False)
-    if mask.any():
-        row = df[mask].iloc[0]
-        return {"code": row["基金代码"], "name": row["基金简称"]}
+    # 原始名称列
+    names = df["基金简称"].astype(str).tolist()
+    codes = df["基金代码"].astype(str).tolist()
+    
+    # 1. 精确匹配
+    for i, name in enumerate(names):
+        if keyword == name:
+            return {"code": codes[i], "name": name}
+    
+    # 2. 忽略大小写包含匹配
+    kw_lower = keyword.lower()
+    for i, name in enumerate(names):
+        if kw_lower in name.lower():
+            return {"code": codes[i], "name": name}
+    
+    # 3. 清洗后匹配：移除括号、空格、特殊符号
+    def clean(text):
+        return re.sub(r'[\(\)\s\-_（)）]', '', text).lower()
+    clean_kw = clean(keyword)
+    for i, name in enumerate(names):
+        if clean_kw in clean(name):
+            return {"code": codes[i], "name": name}
+    
+    # 4. 只保留中文和数字匹配
+    def extract_cn_num(text):
+        return re.sub(r'[^\u4e00-\u9fa50-9]', '', text)
+    cn_kw = extract_cn_num(keyword)
+    for i, name in enumerate(names):
+        if cn_kw and cn_kw in extract_cn_num(name):
+            return {"code": codes[i], "name": name}
+    
+    # 5. 提取基金公司 + 核心词（如“建信新兴市场”）
+    core_match = re.search(r'([\u4e00-\u9fa5]{2,6})(?:新兴|全球|纳斯达克|科创板|成长)', keyword)
+    if core_match:
+        core = core_match.group(1)
+        for i, name in enumerate(names):
+            if core in name:
+                return {"code": codes[i], "name": name}
+    
+    # 6. 最后尝试用 AkShare 实时接口再搜一次（兜底）
+    try:
+        df_ak = ak.fund_name_em()
+        for _, row in df_ak.iterrows():
+            if clean_kw in clean(row["基金简称"]):
+                return {"code": row["基金代码"], "name": row["基金简称"]}
+    except:
+        pass
+    
     return {}
 
 # ---------------------- 百度OCR识别函数（含图片压缩）----------------------
