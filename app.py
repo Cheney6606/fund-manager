@@ -15,8 +15,6 @@ import io
 import akshare as ak
 
 # ====================== 使用 Streamlit Secrets 管理密钥 ======================
-# 请在 Streamlit Cloud 的 Settings -> Secrets 中添加以下内容：
-# SUPABASE_URL, SUPABASE_KEY, DEEPSEEK_API_KEY, BAIDU_OCR_API_KEY, BAIDU_OCR_SECRET_KEY
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
@@ -49,7 +47,6 @@ def ocr_image(image_file):
         return ""
     try:
         img = Image.open(image_file)
-        # 压缩图片避免参数错误
         img.thumbnail((1024, 1024))
         buffered = io.BytesIO()
         img.save(buffered, format="PNG")
@@ -83,26 +80,6 @@ def get_deepseek_client():
         timeout=Timeout(30.0, connect=10.0, read=30.0),
         max_retries=2
     )
-
-def query_fund_code_by_name(name: str) -> dict:
-    """根据基金名称查询代码，返回 {"code": "xxxxxx", "name": "标准名称"}"""
-    client = get_deepseek_client()
-    prompt = f"""请查询基金名称为"{name}"的6位数字代码。只返回一个JSON：{{"code": "xxxxxx", "name": "基金全称"}}。如果找不到，code留空。不要输出任何其他文字。"""
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
-            temperature=0
-        )
-        content = response.choices[0].message.content.strip()
-        json_match = re.search(r'\{.*\}', content, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group())
-        return {}
-    except Exception as e:
-        st.error(f"AI查询代码失败：{e}")
-        return {}
 
 def parse_portfolio_by_ai(ocr_text: str) -> list:
     """使用DeepSeek从OCR文字中提取基金名称和持仓金额"""
@@ -139,7 +116,35 @@ OCR文字内容：
         st.error(f"AI解析失败：{e}")
         return []
 
-# ---------------------- 基金数据获取（修复历史净值接口）----------------------
+# ---------------------- AkShare 基金代码查询（合规、免费、准确）----------------------
+@st.cache_data(ttl=86400)  # 缓存全市场基金列表，每天更新一次
+def get_all_funds_df():
+    """获取全市场基金列表 DataFrame，包含 ['基金代码', '基金简称']"""
+    try:
+        df = ak.fund_name_em()
+        return df[["基金代码", "基金简称"]].copy()
+    except Exception as e:
+        st.error(f"获取基金列表失败：{e}")
+        return pd.DataFrame(columns=["基金代码", "基金简称"])
+
+def query_fund_code_akshare(keyword: str) -> dict:
+    """根据关键词模糊匹配基金代码和标准名称，返回 {"code": "xxxxxx", "name": "标准简称"}"""
+    if not keyword:
+        return {}
+    df = get_all_funds_df()
+    if df.empty:
+        return {}
+    # 模糊匹配：名称包含关键词
+    mask = df["基金简称"].str.contains(keyword.replace("C", "").replace("A", ""), case=False, na=False)
+    if not mask.any():
+        # 再尝试原词匹配
+        mask = df["基金简称"].str.contains(keyword, case=False, na=False)
+    if mask.any():
+        row = df[mask].iloc[0]
+        return {"code": row["基金代码"], "name": row["基金简称"]}
+    return {}
+
+# ---------------------- 基金数据获取（历史净值用 AkShare）----------------------
 def get_fund_info(fund_code):
     url = f"http://fundgz.1234567.com.cn/js/{fund_code}.js"
     try:
@@ -160,7 +165,7 @@ def get_fund_info(fund_code):
         return None
 
 def get_historical_nav(fund_code, days=365):
-    """使用 AkShare 获取历史净值，稳定可靠"""
+    """使用 AkShare 获取历史净值"""
     try:
         df = ak.fund_open_fund_info_em(symbol=fund_code, indicator="单位净值走势")
         if df.empty:
@@ -321,7 +326,7 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理（AI解析版）----------------------
+# ---------------------- 持仓管理（AI解析 + AkShare代码查询）----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
@@ -335,13 +340,13 @@ elif page == "📁 持仓管理":
                     if funds_parsed:
                         st.success(f"识别到 {len(funds_parsed)} 只基金")
                         
-                        # 用AI补全代码
+                        # 使用 AkShare 补全代码
                         for fund in funds_parsed:
-                            if "code" not in fund:
-                                ai_result = query_fund_code_by_name(fund["name"])
-                                fund["code"] = ai_result.get("code", "")
-                                if ai_result.get("name"):
-                                    fund["name"] = ai_result["name"]
+                            if "code" not in fund or not fund["code"]:
+                                ak_result = query_fund_code_akshare(fund["name"])
+                                if ak_result.get("code"):
+                                    fund["code"] = ak_result["code"]
+                                    fund["name"] = ak_result["name"]
                         
                         res_existing = supabase.table("portfolio").select("*").execute()
                         df_existing = pd.DataFrame(res_existing.data) if res_existing.data else pd.DataFrame()
@@ -363,18 +368,33 @@ elif page == "📁 持仓管理":
                             })
                         
                         df_preview = pd.DataFrame(preview_data)
-                        st.dataframe(df_preview, use_container_width=True)
+                        edited_df = st.data_editor(
+                            df_preview,
+                            column_config={
+                                "状态": st.column_config.TextColumn(disabled=True),
+                                "基金代码": st.column_config.TextColumn(),
+                                "基金名称": st.column_config.TextColumn(),
+                                "识别市值": st.column_config.TextColumn(disabled=True),
+                                "当前份额": st.column_config.TextColumn(disabled=True),
+                                "当前成本": st.column_config.TextColumn(disabled=True),
+                            },
+                            use_container_width=True,
+                            key="fund_editor"
+                        )
                         
-                        missing_codes = any(f.get("code") == "" for f in funds_parsed)
+                        missing_codes = any(row["基金代码"] in ["", "⚠️ 未识别"] for _, row in edited_df.iterrows())
                         if missing_codes:
-                            st.warning("部分基金未能识别代码，可在下方表格手动输入代码后点击更新")
+                            st.warning("部分基金未能识别代码，请在上方表格中手动输入6位代码后点击更新")
                         
                         if st.button("✅ 确认更新到我的持仓", type="primary"):
-                            for fund in funds_parsed:
-                                code = fund.get("code")
-                                name = fund["name"]
-                                if not code or not name:
+                            for _, row in edited_df.iterrows():
+                                code = row["基金代码"].strip()
+                                name = row["基金名称"].strip()
+                                if not code or code == "⚠️ 未识别" or not name:
                                     continue
+                                market_str = row["识别市值"].replace("¥", "").replace(",", "")
+                                market_value = float(market_str) if market_str else 0.0
+                                
                                 existing = df_existing[df_existing["fund_code"] == code] if not df_existing.empty else pd.DataFrame()
                                 if not existing.empty:
                                     update_dict = {
