@@ -51,60 +51,90 @@ def load_full_fund_list():
     except:
         return pd.DataFrame(columns=["基金代码", "基金简称"])
 
-def query_fund_code_smart(keyword: str) -> dict:
-    """智能匹配：优先C类份额，加权评分"""
+import difflib
+
+def query_fund_code(keyword: str) -> dict:
+    """智能基金代码匹配，优先C类，使用相似度阈值防止乱匹配"""
     if not keyword:
         return {}
     df = load_full_fund_list()
     if df.empty:
         return {}
-    
-    st.sidebar.write(f"🔍 正在匹配: {keyword}")
-    
-    # 清洗原始名称，用于构建关键词
-    clean_kw = re.sub(r'[\(\)\s\-_]', '', keyword).lower()
-    # 提取中文核心部分（去除英文字母和数字后的纯中文）
-    chinese_core = re.sub(r'[^\u4e00-\u9fa5]', '', keyword)
-    
+
+    # 原始名称列表和代码列表
+    names = df["基金简称"].astype(str).tolist()
+    codes = df["基金代码"].astype(str).tolist()
+
+    # ---------- 第1级：完全精确匹配 ----------
+    for i, name in enumerate(names):
+        if keyword == name:
+            return {"code": codes[i], "name": name}
+
+    # ---------- 第2级：忽略大小写的包含匹配，且优先C类 ----------
+    kw_lower = keyword.lower()
     candidates = []
-    for _, row in df.iterrows():
-        code = row["基金代码"]
-        name = row["基金简称"]
-        name_clean = re.sub(r'[\(\)\s\-_]', '', name).lower()
-        
-        # 评分规则
-        score = 0
-        # 1. 名称包含关系
-        if clean_kw in name_clean:
-            score += 50
-        elif name_clean in clean_kw:
-            score += 40
-        # 2. 核心中文完全匹配
-        if chinese_core and chinese_core in re.sub(r'[^\u4e00-\u9fa5]', '', name):
-            score += 30
-        # 3. 优先C类份额
-        if 'C' in keyword or 'C类' in keyword:
-            if 'C' in name or 'C类' in name:
-                score += 20
-        # 4. 长度相似度（防止匹配到过长或过短的名称）
-        len_diff = abs(len(name) - len(keyword))
-        if len_diff < 5:
-            score += 10
-        elif len_diff < 10:
-            score += 5
-        
-        if score > 0:
-            candidates.append((score, code, name))
-    
-    if not candidates:
-        st.sidebar.warning("未找到任何候选")
-        return {}
-    
-    # 按评分排序，取最高分
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best = candidates[0]
-    st.sidebar.write(f"✅ 最佳匹配 (评分{best[0]}): {best[2]} ({best[1]})")
-    return {"code": best[1], "name": best[2]}
+    for i, name in enumerate(names):
+        name_lower = name.lower()
+        if kw_lower in name_lower or name_lower in kw_lower:
+            candidates.append((codes[i], name, name_lower))
+    if candidates:
+        # 优先返回含'c'的（因为用户输入的名称大多含C）
+        for code, name, name_lower in candidates:
+            if 'c' in name_lower:
+                return {"code": code, "name": name}
+        # 否则返回第一个
+        return {"code": candidates[0][0], "name": candidates[0][1]}
+
+    # ---------- 第3级：清洗后匹配（保留字母数字中文）----------
+    def clean(text):
+        # 只保留中文、字母、数字，其他符号移除
+        return re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', text).lower()
+
+    clean_kw = clean(keyword)
+    for i, name in enumerate(names):
+        if clean_kw in clean(name):
+            return {"code": codes[i], "name": name}
+
+    # ---------- 第4级：提取核心关键词（基金公司+特征词）----------
+    # 例如从“建信新兴市场优选混合(QDII)C”中提取“建信新兴市场”
+    core_match = re.search(r'([\u4e00-\u9fa5]{2,4})(?:新兴|全球|纳斯达克|科创板|成长|价值|稳健)', keyword)
+    if core_match:
+        core = core_match.group(1)
+        for i, name in enumerate(names):
+            if core in name:
+                # 再次优先C类
+                if 'c' in name.lower() and 'c' in keyword.lower():
+                    return {"code": codes[i], "name": name}
+                else:
+                    # 暂存，不立即返回
+                    pass
+        # 如果没有C类偏好，返回第一个含核心词的
+        for i, name in enumerate(names):
+            if core in name:
+                return {"code": codes[i], "name": name}
+
+    # ---------- 第5级：difflib相似度匹配（仅当相似度>0.8）----------
+    best_ratio = 0
+    best_match = None
+    for i, name in enumerate(names):
+        ratio = difflib.SequenceMatcher(None, keyword.lower(), name.lower()).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_match = (codes[i], name)
+    if best_ratio > 0.8 and best_match:
+        return {"code": best_match[0], "name": best_match[1]}
+
+    # ---------- 第6级：用AkShare实时再搜一次（兜底）----------
+    try:
+        df_ak = ak.fund_name_em()
+        for _, row in df_ak.iterrows():
+            name_ak = row["基金简称"]
+            if clean_kw in clean(name_ak):
+                return {"code": row["基金代码"], "name": name_ak}
+    except:
+        pass
+
+    return {}
 
 # ---------------------- 百度OCR ----------------------
 def get_baidu_access_token():
