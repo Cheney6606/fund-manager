@@ -116,32 +116,48 @@ OCR文字内容：
         st.error(f"AI解析失败：{e}")
         return []
 
-# ---------------------- AkShare 基金代码查询（合规、免费、准确）----------------------
-@st.cache_data(ttl=86400)  # 缓存全市场基金列表，每天更新一次
+# ---------------------- AkShare 基金代码查询（带调试信息）----------------------
+@st.cache_data(ttl=3600)  # 缓存1小时，方便调试
 def get_all_funds_df():
     """获取全市场基金列表 DataFrame，包含 ['基金代码', '基金简称']"""
     try:
+        st.info("正在从 AkShare 获取全市场基金列表...")
         df = ak.fund_name_em()
+        st.success(f"✅ 成功获取基金列表，共 {len(df)} 条记录")
         return df[["基金代码", "基金简称"]].copy()
     except Exception as e:
-        st.error(f"获取基金列表失败：{e}")
+        st.error(f"❌ 获取基金列表失败：{e}")
         return pd.DataFrame(columns=["基金代码", "基金简称"])
 
 def query_fund_code_akshare(keyword: str) -> dict:
     """根据关键词模糊匹配基金代码和标准名称，返回 {"code": "xxxxxx", "name": "标准简称"}"""
     if not keyword:
         return {}
+    
+    # 显示正在查询的关键词
+    st.write(f"🔍 正在查询：{keyword}")
+    
     df = get_all_funds_df()
     if df.empty:
+        st.warning("⚠️ 基金列表为空，无法查询")
         return {}
-    # 模糊匹配：名称包含关键词
-    mask = df["基金简称"].str.contains(keyword.replace("C", "").replace("A", ""), case=False, na=False)
-    if not mask.any():
-        # 再尝试原词匹配
-        mask = df["基金简称"].str.contains(keyword, case=False, na=False)
-    if mask.any():
-        row = df[mask].iloc[0]
-        return {"code": row["基金代码"], "name": row["基金简称"]}
+    
+    # 清洗关键词：移除常见后缀和括号内容，提高匹配率
+    clean_keyword = keyword.replace("(QDII)", "").replace("QDII", "").replace("C类", "").replace("C", "").strip()
+    # 也尝试保留C进行匹配
+    keywords_to_try = [keyword, clean_keyword]
+    
+    for kw in keywords_to_try:
+        if not kw:
+            continue
+        mask = df["基金简称"].str.contains(kw, case=False, na=False)
+        if mask.any():
+            row = df[mask].iloc[0]
+            result = {"code": row["基金代码"], "name": row["基金简称"]}
+            st.success(f"✅ 匹配成功：{kw} → {result['code']} {result['name']}")
+            return result
+    
+    st.warning(f"⚠️ 未找到匹配的基金代码，尝试的关键词：{keywords_to_try}")
     return {}
 
 # ---------------------- 基金数据获取（历史净值用 AkShare）----------------------
@@ -326,7 +342,7 @@ elif page == "📋 每日操作建议":
     except Exception as e:
         st.error(f"生成失败：{e}")
 
-# ---------------------- 持仓管理（AI解析 + AkShare代码查询）----------------------
+# ---------------------- 持仓管理（带调试信息）----------------------
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
 
@@ -336,11 +352,13 @@ elif page == "📁 持仓管理":
             with st.spinner("OCR识别中..."):
                 ocr_text = ocr_image(uploaded_file)
                 if ocr_text:
+                    st.text_area("OCR识别文字", ocr_text, height=100)
                     funds_parsed = parse_portfolio_by_ai(ocr_text)
                     if funds_parsed:
                         st.success(f"识别到 {len(funds_parsed)} 只基金")
                         
-                        # 使用 AkShare 补全代码
+                        # 使用 AkShare 补全代码（带调试）
+                        st.subheader("🔎 代码匹配调试信息")
                         for fund in funds_parsed:
                             if "code" not in fund or not fund["code"]:
                                 ak_result = query_fund_code_akshare(fund["name"])
