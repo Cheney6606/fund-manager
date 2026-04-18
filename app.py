@@ -9,15 +9,14 @@ import numpy as np
 from openai import OpenAI
 from supabase import create_client, Client
 from datetime import datetime
-import os
 
-# ====================== 安全配置：从环境变量读取密钥 ======================
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+# ====================== 直接写死正确参数（先跑通再说） ======================
+SUPABASE_URL = "https://jwggzxbbszvvbusjknbu.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp3Z2d6eGJzYnp2dmJ1c2prbmJ1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY0MTY1NTcsImV4cCI6MjA5MTk5MjU1N30.tXN1hJF8B8wB9iejrFEiEpcdTyveDRky0TM4FXrjfDg"
+DEEPSEEK_API_KEY = "sk-e4cfb4a5b57c429b818ad7c1115d1741"
 # ====================================================================================
 
-# 初始化客户端（去掉了不兼容的timeout参数）
+# 初始化客户端（去掉了不兼容的参数）
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 st.set_page_config(page_title="我的基金管家", layout="wide")
