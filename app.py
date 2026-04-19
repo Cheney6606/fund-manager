@@ -130,9 +130,11 @@ def get_deepseek_client() -> OpenAI:
         api_key=DEEPSEEK_API_KEY,
         base_url="https://api.deepseek.com",
         timeout=DEEPSEEK_TIMEOUT,
-        max_retries=2
+        max_retries=2,
+        default_headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
     )
-
 # ====================== 百度 OCR ======================
 def get_baidu_access_token() -> str | None:
     url = "https://aip.baidubce.com/oauth/2.0/token"
@@ -186,37 +188,18 @@ def ocr_image(image_file) -> str:
 
 
 # ====================== AI 解析函数 ======================
-def parse_portfolio_by_ai(ocr_text: str) -> list:
-    """从 OCR 文字提取持仓基金名称和市值"""
+def strategy_advisor(messages: list, context: str) -> str:
+    import time
+    time.sleep(2)
     client = get_deepseek_client()
-    prompt = f"""
-你是一个严格的基金持仓信息提取工具，必须100%遵循以下规则，禁止任何自由发挥：
-
-1. 从以下支付宝基金持仓页面的OCR文字中，提取每一只基金的【完整原始名称】和【持仓市值】。
-2. 基金名称规则：必须完整保留OCR原文中的所有文字，包括括号、QDII、C、ETF等所有关键词，绝对禁止修改、缩写、替换、脑补名称。
-3. 持仓市值规则：提取基金名称右侧的第一个带逗号的数字（单位元），只保留纯数字，去掉逗号和¥符号。只提取持仓总市值，忽略昨日收益、持有收益、收益率等。
-4. 只提取持仓市值大于1000元的基金。
-
-返回格式：纯JSON数组，每个元素为：{{"name": "基金完整原始名称", "market_value": 持仓市值数字}}
-如果无有效基金，返回空数组[]。
-
-OCR原始文字内容：
-{ocr_text}
-"""
+    system_prompt = f"""你是一位专业的量化策略顾问。仅基于以下用户持仓数据和当前策略参数给出优化建议，不做市场预测、不推荐具体基金、不构成任何投资建议。
+{context}"""
+    full_msgs = [{"role": "system", "content": system_prompt}] + messages
     try:
-        resp = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        content = resp.choices[0].message.content.strip()
-        data = safe_json_parse(content, r'\[.*\]')
-        if isinstance(data, list):
-            return [f for f in data if isinstance(f, dict) and f.get("market_value", 0) > 1000]
-        return []
+        resp = client.chat.completions.create(model="deepseek-chat", messages=full_msgs)
+        return resp.choices[0].message.content
     except Exception as e:
-        st.error(f"AI解析失败: {e}")
-        return []
+        return f"AI调用失败: {e}"
 
 def parse_operation_by_ai(ocr_text: str) -> dict:
     """从交易截图提取：基金名称、操作方向、金额、日期"""
