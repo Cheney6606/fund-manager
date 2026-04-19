@@ -1,35 +1,47 @@
-# ==================== 第一部分：导入与基础配置 ====================
 import streamlit as st
 import pandas as pd
 import requests
 import json
 import re
-import os
-import difflib
-import akshare as ak
-from openai import OpenAI, Timeout
-from supabase import create_client, Client
 from datetime import datetime, timedelta, timezone, time as dt_time
 import base64
 from PIL import Image
 import io
+import difflib
+import akshare as ak
+from openai import OpenAI, Timeout
+from supabase import create_client, Client
+import os
 
-# -------------------- 常量定义 --------------------
+# ====================== 常量定义 ======================
+# 时区：东八区
 TZ = timezone(timedelta(hours=8))
+
+# OCR 图片处理
 OCR_THUMBNAIL_SIZE = (2048, 2048)
-CACHE_TTL_FUND_LIST = 3600
-CACHE_TTL_FUND_INFO = 300
-CACHE_TTL_INDUSTRY_DAYS = 7
+
+# 缓存时间
+CACHE_TTL_FUND_LIST = 3600          # 全市场基金列表缓存1小时
+CACHE_TTL_FUND_INFO = 300           # 基金实时信息缓存5分钟
+CACHE_TTL_INDUSTRY_DAYS = 7         # 股票行业缓存7天
+
+# 超时设置
 TIMEOUT_OCR_TOKEN = 10
 TIMEOUT_OCR_REQUEST = 15
 TIMEOUT_FUND_API = 10
 DEEPSEEK_TIMEOUT = Timeout(60.0, connect=10.0, read=60.0)
+
+# 策略默认值
 DEFAULT_T_SELL_THRESHOLD = 2.0
+
+# 卖出边界
 SELL_SHARE_THRESHOLD = 0.01
 MAX_SELL_SHARE_RATIO = 1.0
+
+# 批量操作大小
 BATCH_UPSERT_SIZE = 10
 
-# 法定节假日列表（可按需补充）
+# 交易日判断：简单法定节假日列表（可按需扩展）
 CN_HOLIDAYS = {
     "2026-01-01", "2026-01-02", "2026-01-03",
     "2026-02-12", "2026-02-13", "2026-02-14", "2026-02-15", "2026-02-16",
@@ -40,18 +52,7 @@ CN_HOLIDAYS = {
     "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07",
 }
 
-# 术语统一
-TERMS = {
-    "净值": "单位净值",
-    "成本价": "成本净值",
-    "成本": "成本净值",
-    "涨幅": "日涨跌幅",
-    "持有收益": "持仓盈亏",
-    "持仓市值": "持仓金额",
-    "份额": "持有份额"
-}
-
-# -------------------- Streamlit 页面配置 --------------------
+# ====================== Streamlit 配置 ======================
 st.set_page_config(
     page_title="基金智能管理系统",
     page_icon="📈",
@@ -78,7 +79,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------- 密钥管理（从 Streamlit Secrets 读取）--------------------
+# ====================== 密钥管理 ======================
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
@@ -87,7 +88,8 @@ BAIDU_OCR_SECRET_KEY = st.secrets["BAIDU_OCR_SECRET_KEY"]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# -------------------- 工具函数 --------------------
+
+# ====================== 工具函数 ======================
 def now_cn() -> datetime:
     """返回东八区当前时间"""
     return datetime.now(TZ)
@@ -122,7 +124,7 @@ def safe_json_parse(text: str, pattern: str) -> dict | list | None:
     except json.JSONDecodeError:
         pass
     return None
-# ==================== 第二部分：AI 与 OCR ====================
+# ====================== DeepSeek 客户端 ======================
 def get_deepseek_client() -> OpenAI:
     return OpenAI(
         api_key=DEEPSEEK_API_KEY,
@@ -131,6 +133,7 @@ def get_deepseek_client() -> OpenAI:
         max_retries=2
     )
 
+# ====================== 百度 OCR ======================
 def get_baidu_access_token() -> str | None:
     url = "https://aip.baidubce.com/oauth/2.0/token"
     params = {
@@ -146,6 +149,7 @@ def get_baidu_access_token() -> str | None:
         return None
 
 def ocr_image(image_file) -> str:
+    """高精度优先，失败降级通用，返回识别的纯文本"""
     token = get_baidu_access_token()
     if not token:
         return ""
@@ -180,7 +184,10 @@ def ocr_image(image_file) -> str:
     st.error("OCR识别失败，请重试或检查图片清晰度")
     return ""
 
+
+# ====================== AI 解析函数 ======================
 def parse_portfolio_by_ai(ocr_text: str) -> list:
+    """从 OCR 文字提取持仓基金名称和市值"""
     client = get_deepseek_client()
     prompt = f"""
 你是一个严格的基金持仓信息提取工具，必须100%遵循以下规则，禁止任何自由发挥：
@@ -212,6 +219,7 @@ OCR原始文字内容：
         return []
 
 def parse_operation_by_ai(ocr_text: str) -> dict:
+    """从交易截图提取：基金名称、操作方向、金额、日期"""
     client = get_deepseek_client()
     prompt = f"""
 从以下支付宝基金交易截图的OCR文字中提取信息。返回纯JSON格式：
@@ -232,9 +240,9 @@ OCR文字：
     except Exception as e:
         st.error(f"操作解析失败: {e}")
         return {}
-# ==================== 第三部分：基金数据与匹配 ====================
+# ====================== 全市场基金列表 ======================
 def process_fund_list(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """标准化基金列表，添加公司、份额、币种等辅助字段"""
+    """标准化基金列表字段"""
     def standardize(row):
         name = str(row["基金简称"])
         name = name.translate(str.maketrans('（）【】', '()[]'))
@@ -258,11 +266,14 @@ def process_fund_list(raw_df: pd.DataFrame) -> pd.DataFrame:
             "currency": currency, "core_target": core, "clean_name": clean,
             "name_length": len(name)
         })
-    std = raw_df.apply(standardize, axis=1)
-    return pd.concat([raw_df, std], axis=1)
+
+    std_df = raw_df.apply(standardize, axis=1)
+    full_df = pd.concat([raw_df, std_df], axis=1)
+    return full_df
 
 @st.cache_data(ttl=CACHE_TTL_FUND_LIST)
 def load_full_fund_list() -> pd.DataFrame:
+    """优先读本地CSV，否则用AkShare并保存为CSV"""
     csv_path = "fund_full_list.csv"
     if os.path.exists(csv_path):
         try:
@@ -271,6 +282,7 @@ def load_full_fund_list() -> pd.DataFrame:
                 return process_fund_list(df)
         except Exception:
             pass
+
     try:
         raw_df = ak.fund_name_em()
         raw_df = raw_df[["基金代码", "基金简称"]].copy()
@@ -281,16 +293,20 @@ def load_full_fund_list() -> pd.DataFrame:
         return pd.DataFrame()
 
 def query_fund_code_smart(keyword: str) -> dict:
+    """强约束智能匹配基金代码"""
     if not keyword:
         return {}
     df = load_full_fund_list()
     if df.empty:
         return {}
+    # 1. 6位代码精确匹配
     if keyword.isdigit() and len(keyword) == 6:
         row = df[df["基金代码"] == keyword]
         if not row.empty:
             r = row.iloc[0]
             return {"code": r["基金代码"], "name": r["基金简称"]}
+
+    # 2. 标准化关键词
     kw = str(keyword).translate(str.maketrans('（）【】', '()[]'))
     companies = ["建信", "华夏", "广发", "易方达", "嘉实", "汇添富", "南方", "博时", "富国", "工银瑞信"]
     company = ""
@@ -308,6 +324,7 @@ def query_fund_code_smart(keyword: str) -> dict:
     core = re.sub(r'(混合|ETF联接|指数增强|股票|QDII|A类|C类|发起式|美元|人民币|\(|\)|\s)', '', kw)
     clean_kw = re.sub(r'[\(\)\[\]\s\-_\.，,。·]', '', kw).lower()
 
+    # 3. 筛选
     candidates = df.copy()
     if company:
         candidates = candidates[candidates["company"] == company]
@@ -335,11 +352,15 @@ def query_fund_code_smart(keyword: str) -> dict:
             return {"code": best["基金代码"], "name": best["基金简称"]}
     return {}
 
+
+# ====================== 基金净值接口 ======================
 @st.cache_data(ttl=CACHE_TTL_FUND_INFO, show_spinner=False)
 def get_fund_info_cached(fund_code: str) -> dict | None:
+    """带缓存的基金实时信息获取"""
     return get_fund_info(fund_code)
 
 def get_fund_info(fund_code: str) -> dict | None:
+    """获取实时估值、昨日净值、估算涨跌幅"""
     url = f"http://fundgz.1234567.com.cn/js/{fund_code}.js"
     try:
         resp = requests.get(url, timeout=TIMEOUT_FUND_API)
@@ -359,6 +380,7 @@ def get_fund_info(fund_code: str) -> dict | None:
         return None
 
 def get_historical_nav(fund_code: str, days: int = 365) -> pd.DataFrame | None:
+    """获取历史净值（AkShare）"""
     try:
         df = ak.fund_open_fund_info_em(symbol=fund_code, indicator="单位净值走势")
         if df.empty:
@@ -372,13 +394,17 @@ def get_historical_nav(fund_code: str, days: int = 365) -> pd.DataFrame | None:
         return None
 
 def get_fund_holdings(fund_code: str) -> pd.DataFrame | None:
+    """获取基金最新季报持仓"""
     try:
         df = ak.fund_portfolio_holdings_em(symbol=fund_code)
-        return df if not df.empty else None
+        if df.empty:
+            return None
+        return df
     except Exception:
         return None
-
+# ====================== 行业缓存 ======================
 def get_stock_industry(stock_code: str) -> str:
+    """从缓存或 AkShare 获取股票行业"""
     try:
         res = supabase.table("stock_industry").select("*").eq("stock_code", stock_code).execute()
         if res.data:
@@ -388,6 +414,7 @@ def get_stock_industry(stock_code: str) -> str:
                 return row["industry"]
     except Exception:
         pass
+
     industry = "其他"
     try:
         info = ak.stock_individual_info_em(symbol=stock_code)
@@ -397,6 +424,7 @@ def get_stock_industry(stock_code: str) -> str:
                 industry = match["value"].values[0]
     except Exception:
         pass
+
     try:
         supabase.table("stock_industry").upsert({
             "stock_code": stock_code,
@@ -406,8 +434,11 @@ def get_stock_industry(stock_code: str) -> str:
     except Exception:
         pass
     return industry
-# ==================== 第四部分：市场动态、策略、持仓操作 ====================
+
+
+# ====================== 市场动态 ======================
 def get_market_dynamics() -> dict:
+    """获取指数、北向资金、行业涨跌榜（仅交易日）"""
     if not is_trading_day():
         return {}
     dyn = {}
@@ -434,6 +465,27 @@ def get_market_dynamics() -> dict:
         pass
     return dyn
 
+
+# ====================== 策略配置读写 ======================
+def load_strategy_config() -> dict:
+    try:
+        res = supabase.table("strategy_config").select("*").execute()
+        if res.data:
+            return {row["rule_name"]: float(row["rule_value"]) for row in res.data}
+    except Exception:
+        pass
+    return {"T_SELL_THRESHOLD": DEFAULT_T_SELL_THRESHOLD}
+
+def save_strategy_config(config: dict):
+    for rule_name, rule_value in config.items():
+        supabase.table("strategy_config").upsert({
+            "rule_name": rule_name,
+            "rule_value": rule_value,
+            "updated_at": now_cn().isoformat()
+        }, on_conflict="rule_name").execute()
+
+
+# ====================== 策略顾问 AI ======================
 def strategy_advisor(messages: list, context: str) -> str:
     client = get_deepseek_client()
     system_prompt = f"""你是一位专业的量化策略顾问。仅基于以下用户持仓数据和当前策略参数给出优化建议，不做市场预测、不推荐具体基金、不构成任何投资建议。
@@ -445,7 +497,10 @@ def strategy_advisor(messages: list, context: str) -> str:
     except Exception as e:
         return f"AI调用失败: {e}"
 
+
+# ====================== 先进先出（FIFO）及持仓更新 ======================
 def update_portfolio_on_buy(fund_code: str, fund_name: str, amount: float, price: float, op_date: str):
+    """买入：加权平均成本，插入批次"""
     if price <= 0:
         st.error("买入价格必须大于0")
         return
@@ -453,6 +508,7 @@ def update_portfolio_on_buy(fund_code: str, fund_name: str, amount: float, price
     if shares <= SELL_SHARE_THRESHOLD:
         st.warning("买入份额过小，无需执行")
         return
+
     res = supabase.table("portfolio").select("*").eq("fund_code", fund_code).execute()
     if res.data:
         row = res.data[0]
@@ -475,6 +531,7 @@ def update_portfolio_on_buy(fund_code: str, fund_name: str, amount: float, price
             "buy_date": op_date,
             "realized_profit": 0
         }).execute()
+
     supabase.table("buy_batches").insert({
         "fund_code": fund_code,
         "buy_date": op_date,
@@ -483,10 +540,13 @@ def update_portfolio_on_buy(fund_code: str, fund_name: str, amount: float, price
         "remaining_shares": shares
     }).execute()
 
+
 def update_portfolio_on_sell(fund_code: str, amount: float, price: float, op_date: str):
+    """卖出：先进先出扣减批次，计算已实现收益"""
     if price <= 0:
         st.error("卖出价格必须大于0")
         return
+
     res = supabase.table("portfolio").select("shares").eq("fund_code", fund_code).execute()
     if not res.data:
         st.warning(f"{fund_code} 无持仓，无法卖出")
@@ -542,24 +602,9 @@ def update_portfolio_on_sell(fund_code: str, amount: float, price: float, op_dat
             "updated_at": now_cn().isoformat()
         }).eq("fund_code", fund_code).execute()
 
-def load_strategy_config() -> dict:
-    try:
-        res = supabase.table("strategy_config").select("*").execute()
-        if res.data:
-            return {row["rule_name"]: float(row["rule_value"]) for row in res.data}
-    except Exception:
-        pass
-    return {"T_SELL_THRESHOLD": DEFAULT_T_SELL_THRESHOLD}
-
-def save_strategy_config(config: dict):
-    for rule_name, rule_value in config.items():
-        supabase.table("strategy_config").upsert({
-            "rule_name": rule_name,
-            "rule_value": rule_value,
-            "updated_at": now_cn().isoformat()
-        }, on_conflict="rule_name").execute()
 
 def batch_upsert_portfolio(funds: list):
+    """批量更新/插入持仓"""
     if not funds:
         return
     data = []
@@ -576,20 +621,21 @@ def batch_upsert_portfolio(funds: list):
     for i in range(0, len(data), BATCH_UPSERT_SIZE):
         batch = data[i:i+BATCH_UPSERT_SIZE]
         supabase.table("portfolio").upsert(batch, on_conflict="fund_code").execute()
-# ==================== 第五部分：页面路由与渲染 ====================
+# ====================== 侧边栏导航 ======================
 st.sidebar.title("功能导航")
 page = st.sidebar.radio("选择页面", [
     "📊 持仓总览",
     "📋 每日操作建议",
     "📁 持仓管理",
-    "📎 操作记录",
     "⚙️ 策略配置",
-    "🤖 策略顾问",
     "💬 AI分析师"
 ])
 
+
+# ====================== 页面：持仓总览 ======================
 if page == "📊 持仓总览":
     st.header("📊 持仓总览")
+
     if is_trading_time():
         asset_label = "实时预估总资产"
         profit_label = "当日收益 (预估)"
@@ -616,7 +662,7 @@ if page == "📊 持仓总览":
                 cost = float(row["cost_price"])
                 category = row["category"]
 
-                info = get_fund_info_cached(code)
+                info = get_fund_info(code)
                 if info:
                     nav = info["net_value"]
                     est_nav = info["estimate_value"]
@@ -644,28 +690,46 @@ if page == "📊 持仓总览":
                     })
                 else:
                     rows.append({
-                        "基金名称": name, "基金代码": code, "持仓分类": category,
-                        "持有份额": f"{shares:,.2f}", "成本净值": f"{cost:.4f}",
-                        "单位净值": "获取失败", "持仓盈亏": "-", "持仓收益率": "-", "日涨跌幅": "-"
+                        "基金名称": name,
+                        "基金代码": code,
+                        "持仓分类": category,
+                        "持有份额": f"{shares:,.2f}",
+                        "成本净值": f"{cost:.4f}",
+                        "单位净值": "获取失败",
+                        "持仓盈亏": "-",
+                        "持仓收益率": "-",
+                        "日涨跌幅": "-"
                     })
 
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric(asset_label, f"¥{total_market_value:,.2f}")
+                st.metric(asset_label, f"{total_market_value:,.2f}")
             with col2:
-                st.metric(profit_label, f"¥{total_estimate_profit:+,.2f}")
+                st.metric(profit_label, f"{total_estimate_profit:+,.2f}")
             with col3:
-                st.metric("持仓盈亏 (确定)", f"¥{total_real_profit:+,.2f}")
+                st.metric("持仓盈亏 (确定)", f"{total_real_profit:+,.2f}")
             with col4:
                 total_return = (total_real_profit / total_cost * 100) if total_cost > 0 else 0
                 st.metric("持仓收益率", f"{total_return:+.2f}%")
 
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            def color_returns(val):
+                if isinstance(val, str):
+                    if val.startswith('+'):
+                        return 'color: #e31b23'
+                    elif val.startswith('-'):
+                        return 'color: #2e8b57'
+                return ''
+
+            styled_df = pd.DataFrame(rows).style.applymap(color_returns, subset=['持仓盈亏', '持仓收益率', '日涨跌幅'])
+            st.dataframe(styled_df, use_container_width=True)
     except Exception as e:
         st.error(f"数据加载失败: {e}")
 
+
+# ====================== 页面：每日操作建议 ======================
 elif page == "📋 每日操作建议":
     st.header("📋 每日操作建议")
+
     if is_trading_day():
         with st.expander("📈 今日市场动态", expanded=True):
             dyn = get_market_dynamics()
@@ -696,33 +760,44 @@ elif page == "📋 每日操作建议":
             threshold = config.get("T_SELL_THRESHOLD", DEFAULT_T_SELL_THRESHOLD)
             signals = []
             table_rows = []
+
             for _, row in df.iterrows():
                 code = row["fund_code"]
                 name = row["fund_name"]
                 shares = float(row["shares"])
                 cost = float(row["cost_price"])
                 category = row["category"]
-                info = get_fund_info_cached(code)
+
+                info = get_fund_info(code)
                 if info:
                     nav = info["net_value"]
                     est_nav = info["estimate_value"]
                     est_change = info["estimate_change"]
                     est_profit = shares * (est_nav - nav) if est_nav > 0 else 0
+
                     direction = "无操作"
                     if category == "亏损做T仓" and est_change >= threshold:
                         direction = "做T卖出"
                     elif nav >= cost and (nav / cost - 1) * 100 < 1:
                         direction = "回本减仓"
+
                     table_rows.append({
-                        "基金名称": name, "基金代码": code, "持有份额": f"{shares:,.2f}",
-                        "成本净值": f"{cost:.4f}", "单位净值": f"{nav:.4f}",
-                        "预估涨幅": f"{est_change:+.2f}%", "预估收益": f"¥{est_profit:+,.2f}",
+                        "基金名称": name,
+                        "基金代码": code,
+                        "持有份额": f"{shares:,.2f}",
+                        "成本净值": f"{cost:.4f}",
+                        "单位净值": f"{nav:.4f}",
+                        "预估涨幅": f"{est_change:+.2f}%",
+                        "预估收益": f"¥{est_profit:+,.2f}",
                         "操作方向": direction
                     })
+
                     if direction != "无操作":
                         signals.append(f"{'⚠️' if direction == '做T卖出' else 'ℹ️'} {name}：{direction}")
+
             st.subheader("📊 持仓明细与预估")
             st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+
             st.subheader("📢 今日操作")
             if signals:
                 for s in signals:
@@ -733,10 +808,14 @@ elif page == "📋 每日操作建议":
             else:
                 st.success("今日无触发操作，持有不动")
 
+
+# ====================== 页面：持仓管理（整合截图识别、当前持仓编辑、交易识别）======================
 elif page == "📁 持仓管理":
     st.header("📁 持仓管理")
-    with st.expander("📸 上传支付宝持仓截图，智能更新持仓", expanded=True):
-        uploaded = st.file_uploader("选择截图", type=["png", "jpg", "jpeg"])
+
+    # --- 截图识别持仓 ---
+    with st.expander("📸 上传支付宝持仓截图，智能更新持仓", expanded=False):
+        uploaded = st.file_uploader("选择截图", type=["png", "jpg", "jpeg"], key="portfolio_upload")
         if uploaded:
             with st.spinner("OCR识别中..."):
                 ocr_text = ocr_image(uploaded)
@@ -752,42 +831,83 @@ elif page == "📁 持仓管理":
                                     f["name"] = matched["name"]
                         preview_df = pd.DataFrame(funds)
                         edited_df = st.data_editor(preview_df, use_container_width=True, key="portfolio_preview")
-                        if st.button("✅ 确认更新到我的持仓", type="primary"):
-                            batch_data = []
+                        if st.button("✅ 确认更新到我的持仓", key="confirm_portfolio"):
                             for _, row in edited_df.iterrows():
                                 code = row.get("code", "")
                                 name = row.get("name", "")
+                                market_val = float(row.get("market_value", 0))
                                 if not code or not name:
                                     continue
-                                info = get_fund_info_cached(code)
-                                price = info["net_value"] if info else 0.0
-                                market_val = float(row.get("market_value", 0))
-                                shares = market_val / price if price > 0 else 0
-                                batch_data.append({
-                                    "code": code, "name": name, "category": "盈利底仓",
-                                    "shares": shares, "cost_price": price,
-                                    "buy_date": now_cn().date().isoformat()
-                                })
-                            batch_upsert_portfolio(batch_data)
+                                exist = supabase.table("portfolio").select("fund_code").eq("fund_code", code).execute()
+                                if exist.data:
+                                    supabase.table("portfolio").update({"fund_name": name}).eq("fund_code", code).execute()
+                                else:
+                                    info = get_fund_info(code)
+                                    price = info["net_value"] if info else 0.0
+                                    shares = market_val / price if price > 0 else 0
+                                    supabase.table("portfolio").insert({
+                                        "fund_code": code,
+                                        "fund_name": name,
+                                        "category": "盈利底仓",
+                                        "shares": shares,
+                                        "cost_price": price,
+                                        "buy_date": now_cn().date().isoformat(),
+                                        "realized_profit": 0
+                                    }).execute()
                             st.success("持仓已更新")
                             st.rerun()
                     else:
                         st.warning("未识别到有效基金信息")
 
-elif page == "📎 操作记录":
-    st.header("📎 操作记录")
-    with st.expander("📸 上传支付宝交易截图", expanded=True):
-        uploaded = st.file_uploader("选择截图", type=["png", "jpg", "jpeg"], key="op_upload")
-        if uploaded:
+    # --- 当前持仓编辑 ---
+    st.subheader("📋 当前持仓")
+    try:
+        res = supabase.table("portfolio").select("*").execute()
+        df = pd.DataFrame(res.data) if res.data else pd.DataFrame()
+        if not df.empty:
+            edited_df = st.data_editor(
+                df,
+                column_config={
+                    "fund_code": "基金代码",
+                    "fund_name": "基金名称",
+                    "category": st.column_config.SelectboxColumn("分类", options=["盈利底仓", "亏损做T仓", "观察仓"]),
+                    "shares": st.column_config.NumberColumn("持有份额", format="%.2f"),
+                    "cost_price": st.column_config.NumberColumn("成本净值", format="%.4f"),
+                    "buy_date": "买入日期"
+                },
+                num_rows="dynamic",
+                use_container_width=True,
+                key="portfolio_editor"
+            )
+            if st.button("💾 保存修改", key="save_portfolio_edit"):
+                for _, row in edited_df.iterrows():
+                    supabase.table("portfolio").update({
+                        "fund_name": row["fund_name"],
+                        "category": row["category"],
+                        "shares": row["shares"],
+                        "cost_price": row["cost_price"],
+                        "buy_date": row["buy_date"]
+                    }).eq("fund_code", row["fund_code"]).execute()
+                st.success("保存成功")
+                st.rerun()
+        else:
+            st.info("暂无持仓")
+    except Exception as e:
+        st.error(f"读取失败: {e}")
+
+    # --- 交易截图识别（买入/卖出）---
+    with st.expander("📎 上传支付宝交易截图（买入/卖出）"):
+        uploaded_op = st.file_uploader("选择交易截图", type=["png", "jpg", "jpeg"], key="op_upload")
+        if uploaded_op:
             with st.spinner("识别中..."):
-                ocr_text = ocr_image(uploaded)
+                ocr_text = ocr_image(uploaded_op)
                 if ocr_text:
                     op = parse_operation_by_ai(ocr_text)
                     if op:
                         st.success("识别成功，请核对")
                         preview = pd.DataFrame([op])
                         edited = st.data_editor(preview, use_container_width=True, key="op_preview")
-                        if st.button("✅ 确认记录并更新持仓", type="primary"):
+                        if st.button("✅ 确认记录并更新持仓", key="confirm_op"):
                             row = edited.iloc[0]
                             fund_name = row.get("fund_name", "")
                             operation = row.get("operation", "")
@@ -799,16 +919,18 @@ elif page == "📎 操作记录":
                             else:
                                 code = matched["code"]
                                 name = matched["name"]
-                                info = get_fund_info_cached(code)
+                                info = get_fund_info(code)
                                 price = info["net_value"] if info else 0.0
                                 if operation == "买入":
                                     update_portfolio_on_buy(code, name, amount, price, op_date)
                                 elif operation == "卖出":
                                     update_portfolio_on_sell(code, amount, price, op_date)
                                 supabase.table("operations").insert({
-                                    "fund_code": code, "fund_name": name,
+                                    "fund_code": code,
+                                    "fund_name": name,
                                     "operation_type": "BUY" if operation == "买入" else "SELL",
-                                    "amount": amount, "price": price,
+                                    "amount": amount,
+                                    "price": price,
                                     "shares": amount / price if price > 0 else 0,
                                     "op_date": op_date
                                 }).execute()
@@ -817,28 +939,33 @@ elif page == "📎 操作记录":
                     else:
                         st.warning("未能解析交易信息")
 
+
+# ====================== 页面：策略配置（整合AI策略顾问）======================
 elif page == "⚙️ 策略配置":
     st.header("⚙️ 策略参数配置")
     config = load_strategy_config()
     with st.form("strategy_form"):
-        new_threshold = st.number_input("做T卖出触发涨幅 (%)", value=config.get("T_SELL_THRESHOLD", 2.0), step=0.1)
-        if st.form_submit_button("保存"):
-            config["T_SELL_THRESHOLD"] = new_threshold
+        t_sell = st.number_input("做T卖出触发涨幅 (%)", value=config.get("T_SELL_THRESHOLD", DEFAULT_T_SELL_THRESHOLD), step=0.1)
+        submitted = st.form_submit_button("保存")
+        if submitted:
+            config["T_SELL_THRESHOLD"] = t_sell
             save_strategy_config(config)
             st.success("策略已更新")
             st.rerun()
 
-elif page == "🤖 策略顾问":
-    st.header("🤖 策略顾问")
-    config = load_strategy_config()
+    st.divider()
+    st.subheader("🤖 AI 策略顾问")
     res = supabase.table("portfolio").select("*").execute()
     holdings_text = "\n".join([f"{r['fund_name']}（{r['fund_code']}）：{r['category']}，份额{r['shares']}，成本{r['cost_price']}" for r in res.data]) if res.data else "暂无持仓"
-    context = f"当前策略：做T卖出阈值 {config.get('T_SELL_THRESHOLD', 2.0)}%\n持仓概况：\n{holdings_text}"
+    context = f"当前策略：做T卖出阈值 {config.get('T_SELL_THRESHOLD', DEFAULT_T_SELL_THRESHOLD)}%\n持仓概况：\n{holdings_text}"
+
     if "advisor_messages" not in st.session_state:
         st.session_state.advisor_messages = []
+
     for msg in st.session_state.advisor_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+
     if prompt := st.chat_input("请输入您的问题，例如：我的做T阈值需要调整吗？"):
         st.session_state.advisor_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -849,16 +976,21 @@ elif page == "🤖 策略顾问":
                 st.markdown(reply)
         st.session_state.advisor_messages.append({"role": "assistant", "content": reply})
 
+
+# ====================== 页面：AI分析师 ======================
 elif page == "💬 AI分析师":
     st.header("💬 AI基金分析师")
     res = supabase.table("portfolio").select("*").execute()
     context = "我的持仓：\n" + "\n".join([f"{r['fund_name']}（{r['fund_code']}），份额{r['shares']}，成本{r['cost_price']}" for r in res.data]) if res.data else "暂无持仓"
+
     client = get_deepseek_client()
     if "analyst_messages" not in st.session_state:
         st.session_state.analyst_messages = []
+
     for msg in st.session_state.analyst_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+
     if prompt := st.chat_input("问我任何关于基金的问题"):
         st.session_state.analyst_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
