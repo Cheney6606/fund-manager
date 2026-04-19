@@ -2,8 +2,8 @@ streamlit>=1.35.0
 pandas>=2.1.0
 requests>=2.31.0
 Pillow>=10.0.0
-akshare>=1.18.0  # 用最新版，支持Python 3.8~3.12
+akshare>=1.18.0
 openai>=1.13.0
-supabase>=2.38.0
+supabase==2.38.3  # 明确指定稳定版，避免pip找不到
 python-dotenv>=1.0.0
 tenacity>=8.2.0
